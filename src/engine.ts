@@ -74,6 +74,8 @@ export class Engine {
   private lastWatch = Date.now();
   private needReconcile = true;
   private lastReconcile = 0;
+  private lastReconcileOk = Date.now();
+  private frozen = false;
   private lastPlanKey = new Map<string, string>();
   private lastSummary = 0;
   private running = true;
@@ -213,6 +215,14 @@ export class Engine {
 
   private async cycle() {
     const now = Date.now();
+    // A long-running process has been seen to lose every connection while a fresh one connects
+    // fine. Exiting lets the supervisor start a clean process; resting quotes expire on their own.
+    if (now - this.api.lastResponseAt > config.timing.networkDeadMs) {
+      log.error('no response from the API; exiting so a fresh process can take over', {
+        silentSec: Math.round((now - this.api.lastResponseAt) / 1000),
+      });
+      process.exit(75);
+    }
     this.orders.prune(now);
     for (const ex of this.books.expired(now)) {
       this.books.clearExpiry(ex);
@@ -235,6 +245,11 @@ export class Engine {
         log.warn('reconcile failed; continuing on local state', { err: String(err) });
       }
     }
+    // Sizing against positions we can't confirm is how limits get breached; stop adding risk.
+    const stale = now - this.lastReconcileOk > config.timing.stalePositionsMs;
+    if (stale && !this.frozen) log.warn('positions unconfirmed; only reducing orders until reconcile succeeds');
+    if (!stale && this.frozen) log.info('positions confirmed; resuming');
+    this.frozen = stale;
 
     const { desired, arbs, snipes } = this.plan();
     this.logPlan(desired, arbs);
@@ -294,6 +309,7 @@ export class Engine {
     for (const f of this.recentFills) if (f.at > snapshotAt) this.positions.apply(f.exchangeId, f.side, f.qty);
     this.recentFills = this.recentFills.filter((f) => f.at > snapshotAt - 120_000);
     this.lastReconcile = Date.now();
+    this.lastReconcileOk = this.lastReconcile;
     for (const [id, p] of this.placedSide) if (p.at < snapshotAt - 3_600_000) this.placedSide.delete(id);
   }
 
@@ -343,7 +359,7 @@ export class Engine {
 
       // A newly listed leg is priced against the race's established legs; its opening orders can
       // sit far outside where those put it.
-      const planned = this.planSnipes(race, ext, netYes, budget);
+      const planned = this.frozen ? [] : this.planSnipes(race, ext, netYes, budget);
       if (planned.length) {
         snipes.push(...planned);
         budget -= planned.reduce((a, p) => a + p.snipe.quantity * fromTicks(p.snipe.buy === 'yes' ? p.snipe.limitT : TICKS_PER_UNIT - p.snipe.limitT), 0);
@@ -352,7 +368,7 @@ export class Engine {
 
       // After an arb the held books still show the liquidity it just took until fresh ones arrive,
       // so the same arb would fire again on stale state.
-      const arbReady = (this.arbCooldown.get(race.name) ?? 0) <= Date.now() && !this.needReconcile;
+      const arbReady = (this.arbCooldown.get(race.name) ?? 0) <= Date.now() && !this.needReconcile && !this.frozen;
       const arb = arbReady ? findArb(ext, s.otherMaxTicks, config.arb.minEdgeTicks, config.arb.maxShares) : null;
       if (arb) {
         const room = netYes.map((q) => (arb.kind === 'sell-all' ? config.risk.maxLegShares + q : config.risk.maxLegShares - q));
@@ -381,11 +397,17 @@ export class Engine {
           const priceT = side === 'bid' ? q.bidT : q.askT;
           if (priceT === null) continue;
           if ((this.cooldown.get(`${leg.exchangeId}:${side}`) ?? 0) > Date.now()) continue;
-          const size = Math.min(s.quoteSize, maxOrderSize(side, netYes, zeros, i, config.risk));
-          if (size < 1) continue;
+          // A bid buys back a short, an ask sells down a long: those shrink risk and free capital,
+          // so they skip the capital budget and stay allowed while positions are unconfirmed.
+          const reduces = side === 'bid' ? netYes[i]! < 0 : netYes[i]! > 0;
+          let size = Math.min(s.quoteSize, maxOrderSize(side, netYes, zeros, i, config.risk));
+          if (reduces) size = Math.min(size, Math.abs(netYes[i]!));
+          if (size < 1 || (this.frozen && !reduces)) continue;
           const cost = orderCost(side, priceT, size);
-          if (cost > budget) continue;
-          budget -= cost;
+          if (!reduces) {
+            if (cost > budget) continue;
+            budget -= cost;
+          }
           desired.push({ race: race.name, exchangeId: leg.exchangeId, marketId: leg.marketId, side, priceT, size });
         }
       });

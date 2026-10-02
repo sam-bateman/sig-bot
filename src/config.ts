@@ -36,6 +36,10 @@ export const config = {
     reconcileMs: num('SIG_RECONCILE_MS', 60_000),
     tokenRefreshMs: 150 * 60_000,
     maxResyncsPerCycle: 6,
+    // Stop adding risk when positions haven't been confirmed over REST for this long.
+    stalePositionsMs: num('SIG_STALE_POSITIONS_MS', 180_000),
+    // Exit (for the supervisor to restart) when the API hasn't answered for this long.
+    networkDeadMs: num('SIG_NETWORK_DEAD_MS', 300_000),
     // Orders per batch request. The server places them one at a time, and under load a large batch
     // outlasts the request timeout and the quotes' lifetime; small batches land.
     batchSize: num('SIG_BATCH_SIZE', 5),

@@ -134,6 +134,8 @@ export class Api {
   readonly reads = new TokenBucket(config.limits.readsPerMin);
   readonly writes = new TokenBucket(config.limits.writesPerMin);
   private abort = new AbortController();
+  // When the server last answered at all, error or not. The engine exits if this goes stale.
+  lastResponseAt = Date.now();
 
   // Fail every request in flight, including any sleeping between retries, so shutdown doesn't wait
   // out a 90s retry. Requests made afterwards run normally (the final cancel-all needs them).
@@ -180,11 +182,12 @@ export class Api {
         });
       } catch (err) {
         if (stop.aborted || attempt >= 4) throw err;
-        log.warn('network error, retrying', { path, attempt, err: String(err) });
+        log.warn('network error, retrying', { path, attempt, err: String(err), cause: String((err as { cause?: unknown }).cause ?? '') });
         await wait(backoff(attempt));
         continue;
       }
 
+      this.lastResponseAt = Date.now();
       const text = await res.text();
       const json = text ? safeJson(text) : null;
       // A batch with at least one success comes back as 207; the caller reads per-item results.
