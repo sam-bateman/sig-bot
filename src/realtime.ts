@@ -55,7 +55,11 @@ export interface FeedHandlers {
 const REFRESH_RETRY_MS = [30_000, 60_000, 120_000, 300_000];
 
 export class Feed {
-  private client: SupabaseClient | null = null;
+  // One client (one socket) for the user channel, then one per config.timing.realtimeChannelsPerSocket market channels.
+  private clients: SupabaseClient[] = [];
+  private marketClients: { client: SupabaseClient; markets: number }[] = [];
+  private supabaseUrl = '';
+  private anonKey = '';
   private token = '';
   private channels: RealtimeChannel[] = [];
   private lastRevision = new Map<string, number>();
@@ -69,22 +73,17 @@ export class Feed {
     private readonly api: Api,
     private readonly tournamentId: string,
     private readonly handlers: FeedHandlers,
+    private readonly makeClient: typeof createClient = createClient,
   ) {}
 
   async start(marketIds: string[]) {
     const tok = await this.api.realtimeToken();
     this.token = tok.token;
-    // supabase-js re-reads the token from this callback on every heartbeat. Without it the callback
-    // falls back to the anon key, and channels joined after the first heartbeat are refused.
-    this.client = createClient(tok.supabaseUrl, tok.anonKey, {
-      accessToken: async () => this.token,
-    });
-    await this.client.realtime.setAuth(tok.token);
-
-    this.addMarkets(marketIds);
+    this.supabaseUrl = tok.supabaseUrl;
+    this.anonKey = tok.anonKey;
 
     const userTopic = tok.channels.user;
-    const user = this.client
+    const user = (await this.newClient())
       .channel(userTopic, { config: { private: true } })
       .on('broadcast', { event: 'account_batch' }, ({ payload }) => this.onAccountBatch(userTopic, payload as AccountBatch))
       .on('broadcast', { event: 'position_settled' }, () => this.handlers.onAccountResync())
@@ -94,17 +93,44 @@ export class Feed {
       );
     this.channels.push(user);
 
+    await this.addMarkets(marketIds);
+
     this.scheduleRefresh(config.timing.tokenRefreshMs);
   }
 
-  // Subscribe to more tournament markets on the open connection (e.g. ones listed after startup).
-  addMarkets(marketIds: string[]) {
-    if (!this.client) throw new Error('Feed.addMarkets called before start');
+  private async newClient(): Promise<SupabaseClient> {
+    const socket = this.clients.length;
+    // supabase-js re-reads the token from this callback on every heartbeat. Without it the callback
+    // falls back to the anon key, and channels joined after the first heartbeat are refused.
+    const client = this.makeClient(this.supabaseUrl, this.anonKey, {
+      accessToken: async () => this.token,
+      realtime: {
+        timeout: config.timing.realtimeJoinTimeoutMs,
+        heartbeatCallback: (status, latencyMs) => {
+          if (status === 'timeout') log.warn('realtime heartbeat timeout', { socket });
+          else if (status === 'ok' && latencyMs !== undefined && latencyMs > 5000) log.debug('realtime heartbeat slow', { socket, latencyMs });
+        },
+      },
+    });
+    await client.realtime.setAuth(this.token);
+    this.clients.push(client);
+    return client;
+  }
+
+  // Subscribe to more tournament markets (e.g. ones listed after startup), spreading them over sockets.
+  async addMarkets(marketIds: string[]) {
+    if (this.clients.length === 0) throw new Error('Feed.addMarkets called before start');
     const subscribed = new Set(this.channels.map((c) => c.topic.replace(/^realtime:/, '')));
     for (const marketId of marketIds) {
       const topic = `tournament:${this.tournamentId}:market:${marketId}`;
       if (subscribed.has(topic)) continue;
-      const ch = this.client
+      let slot = this.marketClients.find((s) => s.markets < config.timing.realtimeChannelsPerSocket);
+      if (!slot) {
+        slot = { client: await this.newClient(), markets: 0 };
+        this.marketClients.push(slot);
+      }
+      slot.markets++;
+      const ch = slot.client
         .channel(topic, { config: { private: true } })
         .on('broadcast', { event: 'market_batch' }, ({ payload }) => this.onMarketBatch(topic, marketId, payload as MarketBatch))
         .on('broadcast', { event: 'book_dirty' }, () => this.handlers.onMarketResync(marketId))
@@ -136,7 +162,14 @@ export class Feed {
       this.lastRevision.delete(topic);
       resync(); // initial state, and recovery after any reconnect
     } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
-      if (!this.stopped) log.warn('realtime channel down', { topic, status, err: err?.message });
+      if (!this.stopped) {
+        log.warn('realtime channel down', {
+          topic,
+          status,
+          err: err ? String(err) : undefined,
+          cause: err?.cause ? String(err.cause) : undefined,
+        });
+      }
       setLive(false);
       this.lastRevision.delete(topic);
     }
@@ -187,7 +220,7 @@ export class Feed {
     try {
       const tok = await this.api.realtimeToken();
       this.token = tok.token;
-      await this.client?.realtime.setAuth(tok.token);
+      await Promise.all(this.clients.map((c) => c.realtime.setAuth(tok.token)));
       log.info('realtime token refreshed');
       this.refreshFailures = 0;
       this.lastRevision.clear();
@@ -210,7 +243,7 @@ export class Feed {
     this.stopped = true;
     if (this.refreshTimer) clearTimeout(this.refreshTimer);
     this.refreshTimer = null;
-    await this.client?.removeAllChannels();
+    await Promise.all(this.clients.map((c) => c.removeAllChannels()));
     this.liveMarkets.clear();
     this.userChannelLive = false;
   }

@@ -180,7 +180,7 @@ export class Engine {
       if (race.legs.length < 2) continue; // nothing to price it against yet
       if (!this.active.includes(race)) this.active.push(race);
       this.mapLegs(race);
-      this.feed.addMarkets(race.legs.map((l) => l.marketId));
+      await this.feed.addMarkets(race.legs.map((l) => l.marketId));
       for (const l of race.legs) this.resyncQueue.add(l.exchangeId);
     }
   }

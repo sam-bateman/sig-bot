@@ -43,6 +43,12 @@ export const config = {
     // Orders per batch request. The server places them one at a time, and under load a large batch
     // outlasts the request timeout and the quotes' lifetime; small batches land.
     batchSize: num('SIG_BATCH_SIZE', 5),
+    // Realtime join timeout. Joins queue behind each other on a socket; an abandoned join is still processed
+    // server-side and its retry queues again, so give slow joins time to finish.
+    realtimeJoinTimeoutMs: num('SIG_REALTIME_JOIN_TIMEOUT_MS', 60_000),
+    // Channels per realtime socket. The server handles a socket's joins and heartbeats one at a time, so a
+    // socket with many channels misses heartbeats while (re)joining them and reconnects in a loop.
+    realtimeChannelsPerSocket: num('SIG_REALTIME_CHANNELS_PER_SOCKET', 8),
   },
 
   strategy: {
