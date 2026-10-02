@@ -20,6 +20,7 @@ export interface Touch {
 export interface QuoteParams {
   halfEdgeTicks: number;
   skewTicksPerShare: number;
+  levelSkewTicksPerShare?: number; // missing means 0
 }
 
 export interface LegQuote {
@@ -49,6 +50,12 @@ export function fairValues(touches: Touch[], otherMaxTicks: number): number[] {
   return mids.map((m) => m + shift);
 }
 
+// Average position across a race's legs. Short (or long) on every leg is a nonzero level even
+// though every delta is zero.
+export function raceLevel(netYes: number[]): number {
+  return netYes.reduce((a, b) => a + b, 0) / netYes.length;
+}
+
 // Delta of each leg: how much more the book pays if that leg wins than on average across legs.
 // Holding equal YES on every leg is flat, so only the differences carry risk.
 export function raceDeltas(netYes: number[]): number[] {
@@ -56,10 +63,11 @@ export function raceDeltas(netYes: number[]): number[] {
   return netYes.map((q) => q - mean);
 }
 
-// Quotes for one leg: fair value plus or minus the edge, shifted against inventory, never crossing
-// the external book and never improving on it by more than one tick.
-export function quoteLeg(fairT: number, t: Touch, delta: number, p: QuoteParams): LegQuote {
-  const center = fairT - delta * p.skewTicksPerShare;
+// Quotes for one leg: fair value plus or minus the edge, shifted against inventory (the leg's delta
+// and the race level, which moves every leg together), never crossing the external book and never
+// improving on it by more than one tick.
+export function quoteLeg(fairT: number, t: Touch, delta: number, p: QuoteParams, level = 0): LegQuote {
+  const center = fairT - delta * p.skewTicksPerShare - level * (p.levelSkewTicksPerShare ?? 0);
   let bidT = Math.floor(center - p.halfEdgeTicks + 1e-9);
   let askT = Math.ceil(center + p.halfEdgeTicks - 1e-9);
   bidT = Math.min(bidT, t.bidT + 1, t.askT - 1);
@@ -105,6 +113,43 @@ export function findArb(books: TickBook[], otherMaxTicks: number, minEdgeTicks: 
     if (edge >= minEdgeTicks) {
       const quantity = Math.min(maxShares, ...asks.map((l) => l!.quantity));
       return { kind: 'buy-all', edgeTicks: edge, quantity, legs: asks.map((l, i) => ({ legIndex: i, side: 'ask', priceT: l!.priceT })) };
+    }
+  }
+  return null;
+}
+
+export interface UnwindParams {
+  maxAskSumT: number; // buy back short sets when the YES asks sum to at most this
+  minBidSumT: number; // sell long sets when the YES bids sum to at least this
+  maxShares: number;
+}
+
+// Closes matched sets, one share on every leg. The legs are mutually exclusive, so a short set
+// (short YES on every leg) pays at least n - 1 at settlement and its profit is locked at
+// soldSum - 1; buying it back at asks summing to 1 or less is no worse than waiting, and frees the
+// capital. A long set pays at most 1, so selling it at bids summing to 1 or more is no worse either.
+// Unconfirmed bids (asks) may already have bought (sold) some of the set, so they are netted off.
+export function findUnwind(
+  books: TickBook[],
+  held: { netYes: number[]; pendingBid: number[]; pendingAsk: number[] },
+  p: UnwindParams,
+): Arb | null {
+  const shortSets = Math.min(...held.netYes.map((q, i) => -q - held.pendingBid[i]!));
+  const asks = books.map((b) => b.asks[0]);
+  if (shortSets >= 1 && asks.every(Boolean)) {
+    const askSum = asks.reduce((a, l) => a + l!.priceT, 0);
+    const quantity = Math.floor(Math.min(shortSets, p.maxShares, ...asks.map((l) => l!.quantity)));
+    if (askSum <= p.maxAskSumT && quantity >= 1) {
+      return { kind: 'buy-all', edgeTicks: TICKS_PER_UNIT - askSum, quantity, legs: asks.map((l, i) => ({ legIndex: i, side: 'ask', priceT: l!.priceT })) };
+    }
+  }
+  const longSets = Math.min(...held.netYes.map((q, i) => q - held.pendingAsk[i]!));
+  const bids = books.map((b) => b.bids[0]);
+  if (longSets >= 1 && bids.every(Boolean)) {
+    const bidSum = bids.reduce((a, l) => a + l!.priceT, 0);
+    const quantity = Math.floor(Math.min(longSets, p.maxShares, ...bids.map((l) => l!.quantity)));
+    if (bidSum >= p.minBidSumT && quantity >= 1) {
+      return { kind: 'sell-all', edgeTicks: bidSum - TICKS_PER_UNIT, quantity, legs: bids.map((l, i) => ({ legIndex: i, side: 'bid', priceT: l!.priceT })) };
     }
   }
   return null;

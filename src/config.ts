@@ -52,6 +52,8 @@ export const config = {
     quoteSize: num('SIG_QUOTE_SIZE', 200),
     // Ticks to shift a leg's quotes per share of race delta (inventory skew).
     skewTicksPerShare: num('SIG_SKEW_TICKS_PER_SHARE', 1 / 400),
+    // Ticks to shift every leg's quotes per share of race level (average position across legs).
+    levelSkewTicksPerShare: num('SIG_LEVEL_SKEW_TICKS_PER_SHARE', 1 / 1000),
     // Levels smaller than this are ignored when reading the touch for fair value.
     minFairLevelQty: num('SIG_MIN_FAIR_LEVEL_QTY', 50),
     // Skip a race when any leg's external spread is wider than this.
@@ -65,6 +67,7 @@ export const config = {
   risk: {
     maxLegShares: num('SIG_MAX_LEG_SHARES', 3_000),
     maxRaceDelta: num('SIG_MAX_RACE_DELTA', 2_000),
+    maxRaceLevel: num('SIG_MAX_RACE_LEVEL', 2_000),
     maxGrossCost: num('SIG_MAX_GROSS_COST', 40_000),
   },
 
@@ -89,6 +92,14 @@ export const config = {
     ttlSec: num('SIG_ARB_TTL_SEC', 20),
     // Wait after an arb on a race before arbing it again, so fills and fresh books land first.
     cooldownMs: num('SIG_ARB_COOLDOWN_MS', 30_000),
+  },
+
+  unwind: {
+    // Buy back sets short on every leg when the YES asks sum to at most this (200 = 1.00: no worse than settlement).
+    maxAskSumTicks: num('SIG_UNWIND_MAX_ASK_SUM_TICKS', 200),
+    // Sell sets long on every leg when the YES bids sum to at least this.
+    minBidSumTicks: num('SIG_UNWIND_MIN_BID_SUM_TICKS', 200),
+    maxShares: num('SIG_UNWIND_MAX_SHARES', 5_000),
   },
 };
 

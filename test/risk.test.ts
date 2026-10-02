@@ -119,6 +119,47 @@ describe('maxOrderSize, three legs', () => {
   });
 });
 
+describe('maxOrderSize, race level cap', () => {
+  const big = { maxLegShares: 100_000, maxRaceDelta: 100_000 };
+
+  it('binds a flat two-leg race: cap 300 -> s / 2 <= 300', () => {
+    const l: RiskLimits = { ...big, maxRaceLevel: 300 };
+    assert.equal(maxOrderSize('bid', [0, 0], [0, 0], 0, l), 600);
+    assert.equal(maxOrderSize('ask', [0, 0], [0, 0], 1, l), 600);
+  });
+
+  it('short on both legs at the cap: asks 0, bids still allowed', () => {
+    const l: RiskLimits = { maxLegShares: 1000, maxRaceDelta: 1000, maxRaceLevel: 300 };
+    assert.equal(maxOrderSize('ask', [-300, -300], [0, 0], 0, l), 0);
+    // level room (300 + 300) * 2 = 1200 binds, tighter than leg room 1300 and delta room 1000 / 0.5 = 2000
+    assert.equal(maxOrderSize('bid', [-300, -300], [0, 0], 0, l), 1200);
+    assert.ok(maxOrderSize('bid', [-300, -300], [0, 0], 0, { ...l, maxLegShares: 400 }) > 0);
+  });
+
+  it('beyond the cap: asks 0, bids still allowed', () => {
+    const l: RiskLimits = { ...big, maxRaceLevel: 2000 };
+    assert.equal(maxOrderSize('ask', [-5000, -5000], [0, 0], 0, l), 0);
+    assert.ok(maxOrderSize('bid', [-5000, -5000], [0, 0], 0, l) > 0);
+    assert.equal(maxOrderSize('bid', [5000, 5000], [0, 0], 0, l), 0);
+    assert.ok(maxOrderSize('ask', [5000, 5000], [0, 0], 0, l) > 0);
+  });
+
+  it('three legs: a share moves the level by 1 / 3', () => {
+    const l: RiskLimits = { ...big, maxRaceLevel: 300 };
+    assert.equal(maxOrderSize('bid', [0, 0, 0], [0, 0, 0], 0, l), 900);
+    assert.equal(maxOrderSize('ask', [0, 0, 0], [0, 0, 0], 1, l), 900);
+    // level -150: ask room (300 - 150) * 3, bid room (300 + 150) * 3
+    assert.equal(maxOrderSize('ask', [-150, -150, -150], [0, 0, 0], 0, l), 450);
+    assert.equal(maxOrderSize('bid', [-150, -150, -150], [0, 0, 0], 0, l), 1350);
+  });
+
+  it('subtracts resting size from the level room', () => {
+    const l: RiskLimits = { ...big, maxRaceLevel: 300 };
+    assert.equal(maxOrderSize('bid', [0, 0], [250, 0], 0, l), 350);
+    assert.equal(maxOrderSize('ask', [0, 0], [0, 250], 1, l), 350);
+  });
+});
+
 describe('orderCost', () => {
   it('bid costs price * quantity', () => {
     assert.equal(orderCost('bid', 100, 10), 5);
