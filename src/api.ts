@@ -122,11 +122,25 @@ export class DeadlineError extends Error {
   }
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+// Resolves after ms, or rejects at once when the signal aborts.
+const sleep = (ms: number, signal?: AbortSignal) =>
+  new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) return reject(signal.reason);
+    const t = setTimeout(resolve, ms);
+    signal?.addEventListener('abort', () => (clearTimeout(t), reject(signal.reason)), { once: true });
+  });
 
 export class Api {
   readonly reads = new TokenBucket(config.limits.readsPerMin);
   readonly writes = new TokenBucket(config.limits.writesPerMin);
+  private abort = new AbortController();
+
+  // Fail every request in flight, including any sleeping between retries, so shutdown doesn't wait
+  // out a 90s retry. Requests made afterwards run normally (the final cancel-all needs them).
+  abortInFlight() {
+    this.abort.abort(new Error('aborted for shutdown'));
+    this.abort = new AbortController();
+  }
 
   // `deadline` (epoch ms) bounds the whole call, retries included: past it, the request is abandoned
   // with DeadlineError rather than resent. Use it for payloads that go stale, like expiring quotes.
@@ -142,9 +156,10 @@ export class Api {
     const url = `${config.baseUrl}${path}${qs.size ? `?${qs}` : ''}`;
 
     const deadline = opts.deadline ?? Infinity;
+    const stop = this.abort.signal;
     const wait = async (ms: number) => {
       if (Date.now() + ms >= deadline) throw new DeadlineError(path);
-      await sleep(ms);
+      await sleep(ms, stop);
     };
 
     // Every retry below reuses the same body, so idempotency keys carry over.
@@ -161,10 +176,10 @@ export class Api {
             ...(opts.body !== undefined ? { 'Content-Type': 'application/json' } : {}),
           },
           body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
-          signal: AbortSignal.timeout(Math.min(30_000, left)),
+          signal: AbortSignal.any([AbortSignal.timeout(Math.min(30_000, left)), stop]),
         });
       } catch (err) {
-        if (attempt >= 4) throw err;
+        if (stop.aborted || attempt >= 4) throw err;
         log.warn('network error, retrying', { path, attempt, err: String(err) });
         await wait(backoff(attempt));
         continue;

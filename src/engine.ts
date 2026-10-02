@@ -184,6 +184,7 @@ export class Engine {
       if (!this.running) process.exit(1);
       this.running = false;
       log.info('shutting down');
+      this.api.abortInFlight();
     };
     process.on('SIGINT', stop);
     process.on('SIGTERM', stop);
@@ -620,7 +621,9 @@ export class Engine {
     const batches = Math.min(Math.ceil(toPlace.length / config.timing.batchSize), this.api.writes.available());
     if (batches < Math.ceil(toPlace.length / config.timing.batchSize)) log.debug('write budget short; placing part of the quotes', { batches });
     const expirationDate = new Date(now + config.timing.quoteTtlSec * 1000).toISOString();
-    for (let b = 0; b < batches; b++) {
+    // In parallel: sent one after another, a slow first batch ate the shared deadline and the rest
+    // were dropped unsent.
+    const placeChunk = async (b: number) => {
       const chunk = toPlace.slice(b * config.timing.batchSize, (b + 1) * config.timing.batchSize);
       const reqs: OrderRequest[] = chunk.map((d) => ({
         exchangeId: d.exchangeId,
@@ -653,7 +656,8 @@ export class Engine {
         log.warn('batch failed', { err: String(err) });
         this.needReconcile = true;
       }
-    }
+    };
+    await Promise.all(Array.from({ length: batches }, (_, b) => placeChunk(b)));
   }
 
   private track(req: OrderRequest, data: OrderResult & { remainingQuantity?: number }, kind: OwnOrder['kind']) {
