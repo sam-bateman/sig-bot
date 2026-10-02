@@ -93,6 +93,14 @@ export const config = {
     // Wait after an arb on a race before arbing it again, so fills and fresh books land first.
     cooldownMs: num('SIG_ARB_COOLDOWN_MS', 30_000),
   },
+
+  unwind: {
+    // Buy back sets short on every leg when the YES asks sum to at most this (200 = 1.00: no worse than settlement).
+    maxAskSumTicks: num('SIG_UNWIND_MAX_ASK_SUM_TICKS', 200),
+    // Sell sets long on every leg when the YES bids sum to at least this.
+    minBidSumTicks: num('SIG_UNWIND_MIN_BID_SUM_TICKS', 200),
+    maxShares: num('SIG_UNWIND_MAX_SHARES', 5_000),
+  },
 };
 
 export type Config = typeof config;

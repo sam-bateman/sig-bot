@@ -65,6 +65,9 @@ All settings are environment variables. Read from `.env` if it exists. Defaults 
 | `SIG_MAX_GROSS_COST` | 40000 | Max total cost across all positions |
 | `SIG_ARB_MIN_EDGE_TICKS` | 1 | Min locked profit to take an arb (ticks) |
 | `SIG_ARB_MAX_SHARES` | 2000 | Max shares per arb trade |
+| `SIG_UNWIND_MAX_ASK_SUM_TICKS` | 200 | Buy back all-leg short sets when the YES asks sum to at most this (ticks) |
+| `SIG_UNWIND_MIN_BID_SUM_TICKS` | 200 | Sell all-leg long sets when the YES bids sum to at least this (ticks) |
+| `SIG_UNWIND_MAX_SHARES` | 5000 | Max sets per unwind |
 
 ## How It Works
 
@@ -73,6 +76,8 @@ All settings are environment variables. Read from `.env` if it exists. Defaults 
 **Quoting**: every cycle (default 5s), compute fair values and deltas for each race, check risk limits, and generate quotes. Quotes expire after 60 seconds, so they die if the bot crashes. To re-quote, cancel all orders in a market or tournament-wide (whichever costs fewer API writes) and place new ones. Orders batch up to 25 per write.
 
 **Arbs** are executed as atomic multi-leg orders with a 5-second expiry. If the YES bids sum above 1.00, place bids on every leg to sell YES (buy NO). If the YES asks sum below the target, place asks on every leg to buy YES.
+
+**Unwinds**: when the bot is short YES on every leg of a race and the YES asks sum to 1.00 or less, it buys the matched sets back in one atomic multi-leg order. The mirror image applies to long sets when the YES bids sum to 1.00 or more. That's no worse than holding to settlement, and it frees the capital.
 
 **Reconciliation** runs every 60 seconds: fetch your orders and positions from the API, mark fills, update PnL, and resync any gaps in the book.
 

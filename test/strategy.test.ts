@@ -2,6 +2,7 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   findArb,
+  findUnwind,
   fairValues,
   findSnipes,
   fromTicks,
@@ -424,6 +425,103 @@ describe('findArb', () => {
 
   it('returns null for books with no data at all', () => {
     assert.equal(findArb([book([], []), book([], [])], 4, 1, 100), null);
+  });
+});
+
+describe('findUnwind', () => {
+  const p = { maxAskSumT: 200, minBidSumT: 200, maxShares: 5000 };
+  const flat = [0, 0];
+  const cheap = [book([[90, 9000]], [[99, 9000]]), book([[90, 9000]], [[99, 9000]])]; // asks sum 198, bids sum 180
+
+  it('returns null when flat or mixed-sign, even with asks far below 1.00', () => {
+    const lowAsks = [book([[10, 9000]], [[20, 9000]]), book([[10, 9000]], [[20, 9000]])];
+    assert.equal(findUnwind(lowAsks, { netYes: [0, 0], pendingBid: flat, pendingAsk: flat }, p), null);
+    assert.equal(findUnwind(lowAsks, { netYes: [-500, 0], pendingBid: flat, pendingAsk: flat }, p), null);
+    assert.equal(findUnwind(lowAsks, { netYes: [-500, 500], pendingBid: flat, pendingAsk: flat }, p), null);
+  });
+
+  it('buys back a short set when the asks sum to at most the threshold', () => {
+    const books = [book([[90, 9000]], [[98, 9000]]), book([[90, 9000]], [[100, 9000]])];
+    const arb = findUnwind(books, { netYes: [-500, -500], pendingBid: flat, pendingAsk: flat }, p)!;
+    assert.equal(arb.kind, 'buy-all');
+    assert.equal(arb.edgeTicks, 2);
+    assert.equal(arb.quantity, 500);
+    assert.deepEqual(arb.legs, [
+      { legIndex: 0, side: 'ask', priceT: 98 },
+      { legIndex: 1, side: 'ask', priceT: 100 },
+    ]);
+  });
+
+  it('caps the quantity at the sets held, the top ask size, or maxShares', () => {
+    const short = { netYes: [-500, -500], pendingBid: flat, pendingAsk: flat };
+    assert.equal(findUnwind(cheap, short, p)!.quantity, 500); // sets
+    const thin = [book([[90, 9000]], [[99, 120]]), book([[90, 9000]], [[99, 9000]])];
+    assert.equal(findUnwind(thin, short, p)!.quantity, 120); // top ask
+    assert.equal(findUnwind(cheap, short, { ...p, maxShares: 70 })!.quantity, 70); // maxShares
+  });
+
+  it('respects the ask-sum threshold: 201 fails at 200, 200 gives edge 0, 202 allows 201', () => {
+    const short = { netYes: [-500, -500], pendingBid: flat, pendingAsk: flat };
+    const at = (sum: number) => [book([], [[100, 9000]]), book([], [[sum - 100, 9000]])];
+    assert.equal(findUnwind(at(201), short, p), null);
+    assert.equal(findUnwind(at(200), short, p)!.edgeTicks, 0);
+    assert.equal(findUnwind(at(201), short, { ...p, maxAskSumT: 202 })!.edgeTicks, -1);
+  });
+
+  it('subtracts unconfirmed bids from the short sets', () => {
+    const short = { netYes: [-500, -500], pendingBid: [0, 450], pendingAsk: flat };
+    assert.equal(findUnwind(cheap, short, p)!.quantity, 50);
+    assert.equal(findUnwind(cheap, { ...short, pendingBid: [0, 500] }, p), null);
+    assert.equal(findUnwind(cheap, { ...short, pendingBid: [600, 0] }, p), null);
+  });
+
+  it('sells a long set when the bids sum to at least the threshold', () => {
+    const books = [book([[102, 9000]], [[110, 9000]]), book([[101, 9000]], [[110, 9000]])];
+    const arb = findUnwind(books, { netYes: [400, 600], pendingBid: flat, pendingAsk: flat }, p)!;
+    assert.equal(arb.kind, 'sell-all');
+    assert.equal(arb.edgeTicks, 3);
+    assert.equal(arb.quantity, 400);
+    assert.deepEqual(arb.legs, [
+      { legIndex: 0, side: 'bid', priceT: 102 },
+      { legIndex: 1, side: 'bid', priceT: 101 },
+    ]);
+    const capped = [book([[102, 9000]], [[110, 9000]]), book([[101, 80]], [[110, 9000]])];
+    assert.equal(findUnwind(capped, { netYes: [400, 600], pendingBid: flat, pendingAsk: flat }, p)!.quantity, 80);
+    assert.equal(findUnwind(books, { netYes: [400, 600], pendingBid: flat, pendingAsk: flat }, { ...p, maxShares: 30 })!.quantity, 30);
+  });
+
+  it('subtracts unconfirmed asks from the long sets', () => {
+    const books = [book([[102, 9000]], [[110, 9000]]), book([[101, 9000]], [[110, 9000]])];
+    const long = { netYes: [500, 500], pendingBid: flat, pendingAsk: [0, 450] };
+    assert.equal(findUnwind(books, long, p)!.quantity, 50);
+    assert.equal(findUnwind(books, { ...long, pendingAsk: [0, 500] }, p), null);
+  });
+
+  it('does not sell a long set when the bids sum below the threshold', () => {
+    const books = [book([[99, 9000]], [[110, 9000]]), book([[100, 9000]], [[110, 9000]])];
+    assert.equal(findUnwind(books, { netYes: [500, 500], pendingBid: flat, pendingAsk: flat }, p), null);
+  });
+
+  it('handles a 3-leg race: all legs short unwinds at the smallest, one flat leg does not', () => {
+    const books = [book([], [[60, 9000]]), book([], [[70, 9000]]), book([], [[68, 9000]])];
+    const arb = findUnwind(books, { netYes: [-300, -200, -400], pendingBid: [0, 0, 0], pendingAsk: [0, 0, 0] }, p)!;
+    assert.equal(arb.kind, 'buy-all');
+    assert.equal(arb.edgeTicks, 2);
+    assert.equal(arb.quantity, 200);
+    assert.equal(arb.legs.length, 3);
+    assert.equal(findUnwind(books, { netYes: [-300, 0, -400], pendingBid: [0, 0, 0], pendingAsk: [0, 0, 0] }, p), null);
+  });
+
+  it('returns null when a leg has no asks (short) or no bids (long)', () => {
+    const noAsks = [book([[90, 100]], [[99, 100]]), book([[90, 100]], [])];
+    assert.equal(findUnwind(noAsks, { netYes: [-500, -500], pendingBid: flat, pendingAsk: flat }, p), null);
+    const noBids = [book([[102, 100]], [[110, 100]]), book([], [[110, 100]])];
+    assert.equal(findUnwind(noBids, { netYes: [500, 500], pendingBid: flat, pendingAsk: flat }, p), null);
+  });
+
+  it('caps uneven shorts at the smaller one', () => {
+    const arb = findUnwind(cheap, { netYes: [-300, -1000], pendingBid: flat, pendingAsk: flat }, p)!;
+    assert.equal(arb.quantity, 300);
   });
 });
 

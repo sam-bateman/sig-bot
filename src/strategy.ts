@@ -118,6 +118,43 @@ export function findArb(books: TickBook[], otherMaxTicks: number, minEdgeTicks: 
   return null;
 }
 
+export interface UnwindParams {
+  maxAskSumT: number; // buy back short sets when the YES asks sum to at most this
+  minBidSumT: number; // sell long sets when the YES bids sum to at least this
+  maxShares: number;
+}
+
+// Closes matched sets, one share on every leg. The legs are mutually exclusive, so a short set
+// (short YES on every leg) pays at least n - 1 at settlement and its profit is locked at
+// soldSum - 1; buying it back at asks summing to 1 or less is no worse than waiting, and frees the
+// capital. A long set pays at most 1, so selling it at bids summing to 1 or more is no worse either.
+// Unconfirmed bids (asks) may already have bought (sold) some of the set, so they are netted off.
+export function findUnwind(
+  books: TickBook[],
+  held: { netYes: number[]; pendingBid: number[]; pendingAsk: number[] },
+  p: UnwindParams,
+): Arb | null {
+  const shortSets = Math.min(...held.netYes.map((q, i) => -q - held.pendingBid[i]!));
+  const asks = books.map((b) => b.asks[0]);
+  if (shortSets >= 1 && asks.every(Boolean)) {
+    const askSum = asks.reduce((a, l) => a + l!.priceT, 0);
+    const quantity = Math.floor(Math.min(shortSets, p.maxShares, ...asks.map((l) => l!.quantity)));
+    if (askSum <= p.maxAskSumT && quantity >= 1) {
+      return { kind: 'buy-all', edgeTicks: TICKS_PER_UNIT - askSum, quantity, legs: asks.map((l, i) => ({ legIndex: i, side: 'ask', priceT: l!.priceT })) };
+    }
+  }
+  const longSets = Math.min(...held.netYes.map((q, i) => q - held.pendingAsk[i]!));
+  const bids = books.map((b) => b.bids[0]);
+  if (longSets >= 1 && bids.every(Boolean)) {
+    const bidSum = bids.reduce((a, l) => a + l!.priceT, 0);
+    const quantity = Math.floor(Math.min(longSets, p.maxShares, ...bids.map((l) => l!.quantity)));
+    if (bidSum >= p.minBidSumT && quantity >= 1) {
+      return { kind: 'sell-all', edgeTicks: bidSum - TICKS_PER_UNIT, quantity, legs: bids.map((l, i) => ({ legIndex: i, side: 'bid', priceT: l!.priceT })) };
+    }
+  }
+  return null;
+}
+
 // Prefer contested races: the closer the favourite is to 50%, the more two-way flow.
 export function raceScore(fairs: number[]): number {
   const top = Math.max(...fairs);

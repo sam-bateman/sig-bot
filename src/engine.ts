@@ -8,6 +8,7 @@ import { externalBook, OrderBookkeeper, placementFill, Placements, Positions, re
 import {
   fairValues,
   findArb,
+  findUnwind,
   findSnipes,
   impliedBand,
   fromTicks,
@@ -36,6 +37,7 @@ interface Desired {
 interface PlannedArb {
   race: Race;
   arb: Arb;
+  unwind?: boolean;
 }
 
 interface PlannedSnipe {
@@ -386,6 +388,18 @@ export class Engine {
       // After an arb the held books still show the liquidity it just took until fresh ones arrive,
       // so the same arb would fire again on stale state.
       const arbReady = (this.arbCooldown.get(race.name) ?? 0) <= Date.now() && !this.needReconcile && !this.frozen;
+      // Closing a matched set reduces positions, so it skips the capital budget and room checks.
+      const unwind = arbReady
+        ? findUnwind(
+            ext,
+            { netYes, pendingBid: pending.bid, pendingAsk: pending.ask },
+            { maxAskSumT: config.unwind.maxAskSumTicks, minBidSumT: config.unwind.minBidSumTicks, maxShares: config.unwind.maxShares },
+          )
+        : null;
+      if (unwind && unwind.quantity >= config.arb.minShares) {
+        arbs.push({ race, arb: unwind, unwind: true });
+        continue;
+      }
       const arb = arbReady ? findArb(ext, s.otherMaxTicks, config.arb.minEdgeTicks, config.arb.maxShares) : null;
       if (arb) {
         const room = netYes.map((q, i) =>
@@ -489,7 +503,18 @@ export class Engine {
   }
 
   private logPlan(desired: Desired[], arbs: PlannedArb[]) {
-    for (const { race, arb } of arbs) {
+    for (const { race, arb, unwind } of arbs) {
+      if (unwind) {
+        log.info(config.live ? 'unwind' : 'unwind (dry-run)', {
+          race: race.name,
+          kind: arb.kind,
+          sets: arb.quantity,
+          sum: fromTicks(arb.legs.reduce((a, l) => a + l.priceT, 0)),
+          gainVsSettlement: +(arb.quantity * fromTicks(arb.edgeTicks)).toFixed(2),
+          prices: arb.legs.map((l) => `${race.legs[l.legIndex]!.party}@${fromTicks(l.priceT)}`),
+        });
+        continue;
+      }
       log.info(config.live ? 'arb' : 'arb (dry-run)', {
         race: race.name,
         kind: arb.kind,
