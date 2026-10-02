@@ -3,10 +3,11 @@
 export interface RiskLimits {
   maxLegShares: number;
   maxRaceDelta: number;
+  maxRaceLevel?: number; // average position across legs; missing means no cap
 }
 
-// Largest size for one order on leg `i` that keeps the leg's position and the race delta inside
-// limits, assuming every resting order on that side also fills.
+// Largest size for one order on leg `i` that keeps the leg's position, the race delta and the race
+// level inside limits, assuming every resting order on that side also fills.
 export function maxOrderSize(
   side: 'bid' | 'ask',
   netYes: number[],
@@ -20,14 +21,18 @@ export function maxOrderSize(
   const resting = restingSameSide[i] ?? 0;
   // Trading s shares on one leg moves that leg's delta by s * (1 - 1/n).
   const deltaPerShare = 1 - 1 / n;
+  // ...and the race level by s / n. Orders that move it toward zero stay open past the cap.
+  const maxLevel = limits.maxRaceLevel ?? Infinity;
   if (side === 'bid') {
     const byLeg = limits.maxLegShares - netYes[i]! - resting;
     const byDelta = (limits.maxRaceDelta - delta) / deltaPerShare - resting;
-    return Math.max(0, Math.floor(Math.min(byLeg, byDelta) + 1e-9));
+    const byLevel = (maxLevel - mean) * n - resting;
+    return Math.max(0, Math.floor(Math.min(byLeg, byDelta, byLevel) + 1e-9));
   }
   const byLeg = limits.maxLegShares + netYes[i]! - resting;
   const byDelta = (limits.maxRaceDelta + delta) / deltaPerShare - resting;
-  return Math.max(0, Math.floor(Math.min(byLeg, byDelta) + 1e-9));
+  const byLevel = (maxLevel + mean) * n - resting;
+  return Math.max(0, Math.floor(Math.min(byLeg, byDelta, byLevel) + 1e-9));
 }
 
 // Capital an order ties up: YES costs its price, NO costs one minus it.

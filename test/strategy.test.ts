@@ -8,6 +8,7 @@ import {
   impliedBand,
   quoteLeg,
   raceDeltas,
+  raceLevel,
   raceScore,
   toTicks,
   touch,
@@ -165,6 +166,19 @@ describe('raceDeltas', () => {
   });
 });
 
+describe('raceLevel', () => {
+  it('is the mean of the legs', () => {
+    assert.equal(raceLevel([100, -40]), 30);
+    assert.equal(raceLevel([-30, -30, -30]), -30);
+    assert.equal(raceLevel([90, 0, 0]), 30);
+  });
+
+  it('is zero when flat', () => {
+    assert.equal(raceLevel([0, 0]), 0);
+    assert.equal(raceLevel([0, 0, 0]), 0);
+  });
+});
+
 describe('quoteLeg', () => {
   const params = { halfEdgeTicks: 2, skewTicksPerShare: 1 / 400 };
 
@@ -188,15 +202,18 @@ describe('quoteLeg', () => {
         for (const fair of [bidT - 10, bidT, bidT + width / 2, askT, askT + 10]) {
           for (const delta of [-1000, -50, 0, 50, 1000]) {
             for (const halfEdgeTicks of [0, 0.5, 1, 2, 5]) {
-              const q = quoteLeg(fair, { bidT, askT }, delta, { halfEdgeTicks, skewTicksPerShare: 1 / 400 });
-              const ctx = JSON.stringify({ bidT, askT, fair, delta, halfEdgeTicks, q });
-              if (q.bidT !== null) {
-                assert.ok(q.bidT <= askT - 1, `bid crosses ask: ${ctx}`);
-                assert.ok(q.bidT <= bidT + 1, `bid improves by >1 tick: ${ctx}`);
-              }
-              if (q.askT !== null) {
-                assert.ok(q.askT >= bidT + 1, `ask crosses bid: ${ctx}`);
-                assert.ok(q.askT >= askT - 1, `ask improves by >1 tick: ${ctx}`);
+              for (const level of [-5000, -300, 0, 300, 5000]) {
+                const q = quoteLeg(fair, { bidT, askT }, delta, { halfEdgeTicks, skewTicksPerShare: 1 / 400, levelSkewTicksPerShare: 1 / 1000 }, level);
+                const ctx = JSON.stringify({ bidT, askT, fair, delta, halfEdgeTicks, level, q });
+                if (q.bidT !== null) {
+                  assert.ok(q.bidT <= askT - 1, `bid crosses ask: ${ctx}`);
+                  assert.ok(q.bidT <= bidT + 1, `bid improves by >1 tick: ${ctx}`);
+                }
+                if (q.askT !== null) {
+                  assert.ok(q.askT >= bidT + 1, `ask crosses bid: ${ctx}`);
+                  assert.ok(q.askT >= askT - 1, `ask improves by >1 tick: ${ctx}`);
+                }
+                if (q.bidT !== null && q.askT !== null) assert.ok(q.bidT < q.askT, `own quotes meet: ${ctx}`);
               }
             }
           }
@@ -226,6 +243,32 @@ describe('quoteLeg', () => {
     assert.deepEqual(flat, { bidT: 94, askT: 106 });
     assert.deepEqual(long, { bidT: 92, askT: 104 });
     assert.ok(short.bidT! > flat.bidT! && short.askT! > flat.askT!);
+  });
+
+  it('short level raises both quotes, long level lowers them', () => {
+    const t = { bidT: 95, askT: 105 };
+    const p = { halfEdgeTicks: 6, skewTicksPerShare: 0.5, levelSkewTicksPerShare: 0.01 };
+    const flat = quoteLeg(100, t, 0, p, 0); // 94/106
+    const short = quoteLeg(100, t, 0, p, -200); // center 102 -> 96/108
+    const long = quoteLeg(100, t, 0, p, 200); // center 98 -> 92/104
+    assert.deepEqual(flat, { bidT: 94, askT: 106 });
+    assert.deepEqual(short, { bidT: 96, askT: 108 });
+    assert.deepEqual(long, { bidT: 92, askT: 104 });
+  });
+
+  it('ignores the level when levelSkewTicksPerShare is missing or 0', () => {
+    const t = { bidT: 95, askT: 105 };
+    const base = { halfEdgeTicks: 6, skewTicksPerShare: 0.5 };
+    const flat = quoteLeg(100, t, 0, base);
+    assert.deepEqual(quoteLeg(100, t, 0, base, -200), flat);
+    assert.deepEqual(quoteLeg(100, t, 0, { ...base, levelSkewTicksPerShare: 0 }, 200), flat);
+  });
+
+  it('level skew and delta skew add up', () => {
+    const t = { bidT: 95, askT: 105 };
+    const p = { halfEdgeTicks: 6, skewTicksPerShare: 0.5, levelSkewTicksPerShare: 0.01 };
+    // center = 100 - 4 * 0.5 - (-300) * 0.01 = 101 -> 95/107
+    assert.deepEqual(quoteLeg(100, t, 4, p, -300), { bidT: 95, askT: 107 });
   });
 
   it('floors the bid and ceils the ask on fractional fair values', () => {

@@ -13,6 +13,7 @@ import {
   fromTicks,
   quoteLeg,
   raceDeltas,
+  raceLevel,
   raceScore,
   toTicks,
   touch,
@@ -405,9 +406,10 @@ export class Engine {
       }
       const fairs = fairValues(touches as Touch[], s.otherMaxTicks);
       const deltas = raceDeltas(netYes);
+      const level = raceLevel(netYes);
 
       race.legs.forEach((leg, i) => {
-        const q = quoteLeg(fairs[i]!, touches[i]!, deltas[i]!, s);
+        const q = quoteLeg(fairs[i]!, touches[i]!, deltas[i]!, s, level);
         for (const side of ['bid', 'ask'] as const) {
           const priceT = side === 'bid' ? q.bidT : q.askT;
           if (priceT === null) continue;

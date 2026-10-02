@@ -20,6 +20,7 @@ export interface Touch {
 export interface QuoteParams {
   halfEdgeTicks: number;
   skewTicksPerShare: number;
+  levelSkewTicksPerShare?: number; // missing means 0
 }
 
 export interface LegQuote {
@@ -49,6 +50,12 @@ export function fairValues(touches: Touch[], otherMaxTicks: number): number[] {
   return mids.map((m) => m + shift);
 }
 
+// Average position across a race's legs. Short (or long) on every leg is a nonzero level even
+// though every delta is zero.
+export function raceLevel(netYes: number[]): number {
+  return netYes.reduce((a, b) => a + b, 0) / netYes.length;
+}
+
 // Delta of each leg: how much more the book pays if that leg wins than on average across legs.
 // Holding equal YES on every leg is flat, so only the differences carry risk.
 export function raceDeltas(netYes: number[]): number[] {
@@ -56,10 +63,11 @@ export function raceDeltas(netYes: number[]): number[] {
   return netYes.map((q) => q - mean);
 }
 
-// Quotes for one leg: fair value plus or minus the edge, shifted against inventory, never crossing
-// the external book and never improving on it by more than one tick.
-export function quoteLeg(fairT: number, t: Touch, delta: number, p: QuoteParams): LegQuote {
-  const center = fairT - delta * p.skewTicksPerShare;
+// Quotes for one leg: fair value plus or minus the edge, shifted against inventory (the leg's delta
+// and the race level, which moves every leg together), never crossing the external book and never
+// improving on it by more than one tick.
+export function quoteLeg(fairT: number, t: Touch, delta: number, p: QuoteParams, level = 0): LegQuote {
+  const center = fairT - delta * p.skewTicksPerShare - level * (p.levelSkewTicksPerShare ?? 0);
   let bidT = Math.floor(center - p.halfEdgeTicks + 1e-9);
   let askT = Math.ceil(center + p.halfEdgeTicks - 1e-9);
   bidT = Math.min(bidT, t.bidT + 1, t.askT - 1);
