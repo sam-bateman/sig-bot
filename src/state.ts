@@ -143,6 +143,20 @@ export class Placements {
   }
 }
 
+// What a placement response says filled and what is left resting. Batch quote responses sign
+// `remainingQuantity` (a resting, unfilled 500-share NO buy came back as -500 with open: true), so
+// its magnitude is used and `quantityTraded` wins when present. Read raw, -500 looked fully filled.
+export function placementFill(
+  quantity: number,
+  data: { open?: boolean; remainingQuantity?: number; quantityTraded?: number },
+): { traded: number; left: number; consistent: boolean } {
+  const remaining = data.remainingQuantity === undefined ? undefined : Math.abs(data.remainingQuantity);
+  const traded = Math.max(0, Math.min(quantity, data.quantityTraded ?? (remaining === undefined ? 0 : quantity - remaining)));
+  const left = data.open === false ? 0 : quantity - traded;
+  const consistent = remaining === undefined || remaining + traded === quantity;
+  return { traded, left, consistent };
+}
+
 // Convert an order's side/action/price into YES terms.
 export function toYes(side: 'yes' | 'no', action: 'buy' | 'sell', priceT: number): { side: 'bid' | 'ask'; priceT: number } {
   const buysYes = (side === 'yes') === (action === 'buy');

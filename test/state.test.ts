@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { OrderBookkeeper, Placements, Positions, externalBook, remaining, toYes, type OwnOrder } from '../src/state.js';
+import { OrderBookkeeper, placementFill, Placements, Positions, externalBook, remaining, toYes, type OwnOrder } from '../src/state.js';
 import { maxOrderSize } from '../src/risk.js';
 import type { Position, RestOrder } from '../src/api.js';
 
@@ -494,5 +494,38 @@ describe('Placements', () => {
       place(ps, `o${cycle}`, { quantity: size, at: 10_000 + cycle });
     }
     assert.ok(truth >= -3_000, `leg reached ${truth}`);
+  });
+});
+
+// Shapes copied from live responses on 2026-10-02.
+describe('placementFill', () => {
+  it('reads a resting batch quote with a negative remainingQuantity as unfilled', () => {
+    assert.deepEqual(placementFill(500, { open: true, remainingQuantity: -500, quantityTraded: 0 }), { traded: 0, left: 500, consistent: true });
+  });
+
+  it('reads a fully filled order', () => {
+    assert.deepEqual(placementFill(500, { open: false, remainingQuantity: 0, quantityTraded: 500 }), { traded: 500, left: 0, consistent: true });
+  });
+
+  it('reads a partial fill whichever sign remainingQuantity has', () => {
+    assert.deepEqual(placementFill(500, { open: true, remainingQuantity: -300, quantityTraded: 200 }), { traded: 200, left: 300, consistent: true });
+    assert.deepEqual(placementFill(500, { open: true, remainingQuantity: 300, quantityTraded: 200 }), { traded: 200, left: 300, consistent: true });
+  });
+
+  it('falls back to remainingQuantity when quantityTraded is missing', () => {
+    assert.deepEqual(placementFill(500, { open: true, remainingQuantity: -500 }), { traded: 0, left: 500, consistent: true });
+    assert.deepEqual(placementFill(500, { open: true, remainingQuantity: 100 }), { traded: 400, left: 100, consistent: true });
+  });
+
+  it('treats a bare response as resting and unfilled', () => {
+    assert.deepEqual(placementFill(500, {}), { traded: 0, left: 500, consistent: true });
+  });
+
+  it('flags fields that disagree', () => {
+    assert.equal(placementFill(500, { open: true, remainingQuantity: -500, quantityTraded: 200 }).consistent, false);
+  });
+
+  it('never credits more than the order size', () => {
+    assert.equal(placementFill(500, { quantityTraded: 900 }).traded, 500);
   });
 });

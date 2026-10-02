@@ -4,7 +4,7 @@ import { config, TICKS_PER_UNIT } from './config.js';
 import { log } from './log.js';
 import { Feed, type AccountBatch } from './realtime.js';
 import { maxOrderSize, orderCost } from './risk.js';
-import { externalBook, OrderBookkeeper, Placements, Positions, remaining, type OwnOrder } from './state.js';
+import { externalBook, OrderBookkeeper, placementFill, Placements, Positions, remaining, type OwnOrder } from './state.js';
 import {
   fairValues,
   findArb,
@@ -551,7 +551,7 @@ export class Engine {
       traded = legs.map(() => 0);
       for (const { index, data } of results) {
         this.track(legs[index]!, data, 'arb');
-        traded[index] = legs[index]!.quantity - (data.remainingQuantity ?? legs[index]!.quantity - (data.quantityTraded ?? 0));
+        traded[index] = placementFill(legs[index]!.quantity, data).traded;
       }
       log.info('arb placed', { race: race.name, kind: arb.kind, qty: arb.quantity, traded });
     } catch (err) {
@@ -724,22 +724,34 @@ export class Engine {
     const side: 'bid' | 'ask' = req.side === 'yes' ? 'bid' : 'ask';
     const priceT = side === 'bid' ? toTicks(req.price) : TICKS_PER_UNIT - toTicks(req.price);
     const now = Date.now();
-    this.placements.record(String(id), { exchangeId: req.exchangeId, side, quantity: req.quantity, traded: 0, at: now });
-    // Batch responses reported resting, unfilled orders as done (MI-07 on 2026-10-02 had no fills
-    // on the exchange). Read as fills they inflated positions; read as gone, the bot re-placed the
-    // quote every cycle and stacked them. So the order is kept as resting, fills come only from the
-    // feed or a snapshot, and the snapshot drops whatever isn't resting.
-    const left = data.remainingQuantity ?? req.quantity - (data.quantityTraded ?? 0);
-    if (data.open === false || left < req.quantity) {
-      log.debug('placement reports a fill; waiting for feed or snapshot', { id, kind, quantity: req.quantity, data });
+    const fill = placementFill(req.quantity, data);
+    if (!fill.consistent) {
+      // A shape we haven't seen: credit nothing and keep the order as resting; the feed or the
+      // next snapshot settles it.
+      log.warn('placement response fields disagree; waiting for snapshot', { id, kind, quantity: req.quantity, data });
+      this.needReconcile = true;
     }
+    const traded = this.placements.record(String(id), {
+      exchangeId: req.exchangeId,
+      side,
+      quantity: req.quantity,
+      traded: fill.consistent ? fill.traded : 0,
+      at: now,
+    });
+    // Credited now so a dead feed can't hide it until the next snapshot.
+    if (traded > 0) {
+      this.positions.apply(req.exchangeId, side, traded);
+      this.recentFills.push({ at: now, exchangeId: req.exchangeId, side, qty: traded });
+    }
+    const left = fill.consistent ? fill.left : req.quantity;
+    if (left <= 0) return;
     this.orders.add({
       id: String(id),
       exchangeId: req.exchangeId,
       side,
       priceT,
       quantity: req.quantity,
-      filled: 0,
+      filled: req.quantity - left,
       feedFilled: 0,
       placedAt: now,
       expiresAt: req.expirationDate ? Date.parse(req.expirationDate) : Infinity,
