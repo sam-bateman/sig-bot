@@ -58,6 +58,8 @@ export class Engine {
   private snapshotAt = 0;
   // Exchange+side pairs whose last placement was rejected outright; skipped until the time given.
   private readonly cooldown = new Map<string, number>();
+  // Race name -> time before which no new arb is fired on it.
+  private readonly arbCooldown = new Map<string, number>();
   private readonly resyncQueue = new Set<string>();
   private readonly marketToExchange = new Map<string, string>();
   private readonly exchangeToMarket = new Map<string, string>();
@@ -348,7 +350,10 @@ export class Engine {
         continue;
       }
 
-      const arb = findArb(ext, s.otherMaxTicks, config.arb.minEdgeTicks, config.arb.maxShares);
+      // After an arb the held books still show the liquidity it just took until fresh ones arrive,
+      // so the same arb would fire again on stale state.
+      const arbReady = (this.arbCooldown.get(race.name) ?? 0) <= Date.now() && !this.needReconcile;
+      const arb = arbReady ? findArb(ext, s.otherMaxTicks, config.arb.minEdgeTicks, config.arb.maxShares) : null;
       if (arb) {
         const room = netYes.map((q) => (arb.kind === 'sell-all' ? config.risk.maxLegShares + q : config.risk.maxLegShares - q));
         const cost = arb.legs.reduce((a, l) => a + orderCost(l.side === 'bid' ? 'ask' : 'bid', l.priceT, 1), 0);
@@ -474,6 +479,8 @@ export class Engine {
   // ---- execution ----
 
   private async executeArb({ race, arb }: PlannedArb) {
+    this.arbCooldown.set(race.name, Date.now() + config.arb.cooldownMs);
+    for (const l of race.legs) this.resyncQueue.add(l.exchangeId);
     // Our own quotes sit inside the touch; left resting, self-trade prevention would cancel the
     // arb leg that crosses them and leave the other legs naked.
     const quoted = race.legs.filter((l) => this.orders.forExchange(l.exchangeId).length > 0);
@@ -495,7 +502,7 @@ export class Engine {
     }));
     let traded: number[] = [];
     try {
-      const r = await this.api.placeMultiLeg(legs);
+      const r = await this.api.placeMultiLeg(legs, Date.parse(expirationDate) - 5_000);
       const results = (r.results ?? []) as { index: number; data: OrderResult & { remainingQuantity?: number } }[];
       traded = legs.map(() => 0);
       for (const { index, data } of results) {
@@ -538,7 +545,7 @@ export class Engine {
       tournamentId: this.tournament.id,
     }));
     try {
-      const r = await this.api.placeBatch(reqs);
+      const r = await this.api.placeBatch(reqs, Date.parse(expirationDate) - 5_000);
       for (const item of r.results ?? []) {
         if (item.ok) this.track(reqs[item.index]!, item.data as OrderResult & { remainingQuantity?: number }, 'snipe');
         else log.warn('snipe rejected', { exchangeId: reqs[item.index]?.exchangeId, status: item.status, data: item.data });

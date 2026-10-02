@@ -283,10 +283,10 @@ export class Api {
     });
   }
 
-  placeMultiLeg(legs: OrderRequest[]) {
-    return this.post<{ legs?: OrderResult[]; orders?: OrderResult[]; results?: OrderResult[] }>('/orders/multi-leg', {
-      idempotencyKey: randomUUID(),
-      legs,
+  placeMultiLeg(legs: OrderRequest[], deadline?: number) {
+    return this.request<{ legs?: OrderResult[]; orders?: OrderResult[]; results?: OrderResult[] }>('POST', '/orders/multi-leg', {
+      body: { idempotencyKey: randomUUID(), legs },
+      deadline,
     });
   }
 

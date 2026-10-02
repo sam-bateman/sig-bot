@@ -78,7 +78,10 @@ export const config = {
     minShares: num('SIG_ARB_MIN_SHARES', 20),
     // Minimum locked profit per arb, in SUSQies.
     minProfit: num('SIG_ARB_MIN_PROFIT', 1),
-    ttlSec: 5,
+    // Long enough to survive a slow request; requests give up with under 5s left.
+    ttlSec: num('SIG_ARB_TTL_SEC', 20),
+    // Wait after an arb on a race before arbing it again, so fills and fresh books land first.
+    cooldownMs: num('SIG_ARB_COOLDOWN_MS', 30_000),
   },
 };
 
