@@ -36,6 +36,9 @@ export const config = {
     reconcileMs: num('SIG_RECONCILE_MS', 60_000),
     tokenRefreshMs: 150 * 60_000,
     maxResyncsPerCycle: 6,
+    // Orders per batch request. The server places them one at a time, and under load a large batch
+    // outlasts the request timeout and the quotes' lifetime; small batches land.
+    batchSize: num('SIG_BATCH_SIZE', 5),
   },
 
   strategy: {

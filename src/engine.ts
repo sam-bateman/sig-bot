@@ -44,7 +44,6 @@ interface PlannedSnipe {
   band: { loT: number; hiT: number };
 }
 
-const BATCH_SIZE = 25;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export class Engine {
@@ -591,8 +590,8 @@ export class Engine {
 
     // Either cancel each stale market, or cancel everything once and re-place the full set.
     const perMarketPlace = [...placeOnly, ...[...cancelEx].flatMap((ex) => byEx.get(ex) ?? [])];
-    const perMarketCost = cancelEx.size + Math.ceil(perMarketPlace.length / BATCH_SIZE);
-    const globalCost = 1 + Math.ceil(desired.length / BATCH_SIZE);
+    const perMarketCost = cancelEx.size + Math.ceil(perMarketPlace.length / config.timing.batchSize);
+    const globalCost = 1 + Math.ceil(desired.length / config.timing.batchSize);
     const useGlobal = cancelEx.size > 1 && globalCost < perMarketCost;
     let toPlace = useGlobal ? desired : perMarketPlace;
 
@@ -618,11 +617,11 @@ export class Engine {
       }
     }
 
-    const batches = Math.min(Math.ceil(toPlace.length / BATCH_SIZE), this.api.writes.available());
-    if (batches < Math.ceil(toPlace.length / BATCH_SIZE)) log.debug('write budget short; placing part of the quotes', { batches });
+    const batches = Math.min(Math.ceil(toPlace.length / config.timing.batchSize), this.api.writes.available());
+    if (batches < Math.ceil(toPlace.length / config.timing.batchSize)) log.debug('write budget short; placing part of the quotes', { batches });
     const expirationDate = new Date(now + config.timing.quoteTtlSec * 1000).toISOString();
     for (let b = 0; b < batches; b++) {
-      const chunk = toPlace.slice(b * BATCH_SIZE, (b + 1) * BATCH_SIZE);
+      const chunk = toPlace.slice(b * config.timing.batchSize, (b + 1) * config.timing.batchSize);
       const reqs: OrderRequest[] = chunk.map((d) => ({
         exchangeId: d.exchangeId,
         side: d.side === 'bid' ? 'yes' : 'no',
