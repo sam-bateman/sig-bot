@@ -723,25 +723,25 @@ export class Engine {
     }
     const side: 'bid' | 'ask' = req.side === 'yes' ? 'bid' : 'ask';
     const priceT = side === 'bid' ? toTicks(req.price) : TICKS_PER_UNIT - toTicks(req.price);
-    const left = data.remainingQuantity ?? req.quantity - (data.quantityTraded ?? 0);
     const now = Date.now();
-    // Credit a fill on placement now; waiting for the feed or the next snapshot is how one leg
-    // got quoted again and again while every quote filled.
-    const traded = this.placements.record(String(id), { exchangeId: req.exchangeId, side, quantity: req.quantity, traded: req.quantity - left, at: now });
-    if (traded > 0) {
-      this.positions.apply(req.exchangeId, side, traded);
-      this.recentFills.push({ at: now, exchangeId: req.exchangeId, side, qty: traded });
+    this.placements.record(String(id), { exchangeId: req.exchangeId, side, quantity: req.quantity, traded: 0, at: now });
+    // Batch responses reported resting, unfilled orders as done (MI-07 on 2026-10-02 had no fills
+    // on the exchange). Read as fills they inflated positions; read as gone, the bot re-placed the
+    // quote every cycle and stacked them. So the order is kept as resting, fills come only from the
+    // feed or a snapshot, and the snapshot drops whatever isn't resting.
+    const left = data.remainingQuantity ?? req.quantity - (data.quantityTraded ?? 0);
+    if (data.open === false || left < req.quantity) {
+      log.debug('placement reports a fill; waiting for feed or snapshot', { id, kind, quantity: req.quantity, data });
     }
-    if (data.open === false || left <= 0) return;
     this.orders.add({
       id: String(id),
       exchangeId: req.exchangeId,
       side,
       priceT,
       quantity: req.quantity,
-      filled: req.quantity - left,
+      filled: 0,
       feedFilled: 0,
-      placedAt: Date.now(),
+      placedAt: now,
       expiresAt: req.expirationDate ? Date.parse(req.expirationDate) : Infinity,
       kind,
     });
