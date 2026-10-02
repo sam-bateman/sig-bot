@@ -81,6 +81,68 @@ export class OrderBookkeeper {
   }
 }
 
+interface Placement {
+  exchangeId: string;
+  side: 'bid' | 'ask';
+  quantity: number;
+  at: number;
+  // Shares already counted in positions: the placement response's fill, raised by the feed.
+  applied: number;
+  feedSeen: number;
+}
+
+// Every order we sent, so fills can be credited once and orders whose fate we can't see yet
+// count against the limits. With the account feed down, an order that filled on placement or was
+// picked off after resting just vanishes from our resting set while positions still show the old
+// size until the next REST snapshot; sizing off that placed a fresh quote each cycle and walked a
+// leg past its cap.
+export class Placements {
+  private readonly byId = new Map<string, Placement>();
+  // Placements at or before this are reflected in the last REST positions.
+  private confirmedThrough = 0;
+  private anon = 0;
+
+  // Returns the shares to credit to positions now.
+  record(id: string | null, p: { exchangeId: string; side: 'bid' | 'ask'; quantity: number; traded: number; at: number }): number {
+    const traded = Math.max(0, Math.min(p.quantity, p.traded));
+    this.byId.set(id ?? `anon:${++this.anon}`, { ...p, applied: traded, feedSeen: 0 });
+    return traded;
+  }
+
+  get(id: string) {
+    return this.byId.get(id);
+  }
+
+  // A feed fill for one of our orders. Returns the shares not yet credited: the feed repeats fills
+  // that the placement response already reported.
+  feedFill(id: string, qty: number): number {
+    const p = this.byId.get(id);
+    if (!p) return 0;
+    p.feedSeen += qty;
+    const fresh = Math.max(0, p.feedSeen - p.applied);
+    p.applied += fresh;
+    return fresh;
+  }
+
+  // Shares on one side of an exchange that may have filled without reaching positions yet: orders
+  // placed since the last snapshot that are no longer resting (filled, cancelled, expired, or
+  // never confirmed), less what was already credited.
+  unconfirmed(exchangeId: string, side: 'bid' | 'ask', isResting: (id: string) => boolean): number {
+    let n = 0;
+    for (const [id, p] of this.byId) {
+      if (p.exchangeId !== exchangeId || p.side !== side || p.at <= this.confirmedThrough || isResting(id)) continue;
+      n += Math.max(0, p.quantity - p.applied);
+    }
+    return n;
+  }
+
+  // After a REST snapshot whose positions cover everything placed up to `through`.
+  confirm(through: number, forgetBefore: number) {
+    this.confirmedThrough = Math.max(this.confirmedThrough, through);
+    for (const [id, p] of this.byId) if (p.at < forgetBefore || (id.startsWith('anon:') && p.at <= through)) this.byId.delete(id);
+  }
+}
+
 // Convert an order's side/action/price into YES terms.
 export function toYes(side: 'yes' | 'no', action: 'buy' | 'sell', priceT: number): { side: 'bid' | 'ask'; priceT: number } {
   const buysYes = (side === 'yes') === (action === 'buy');

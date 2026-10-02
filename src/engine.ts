@@ -4,7 +4,7 @@ import { config, TICKS_PER_UNIT } from './config.js';
 import { log } from './log.js';
 import { Feed, type AccountBatch } from './realtime.js';
 import { maxOrderSize, orderCost } from './risk.js';
-import { externalBook, OrderBookkeeper, Positions, remaining, type OwnOrder } from './state.js';
+import { externalBook, OrderBookkeeper, Placements, Positions, remaining, type OwnOrder } from './state.js';
 import {
   fairValues,
   findArb,
@@ -51,8 +51,9 @@ export class Engine {
   private readonly books = new BookStore();
   private readonly orders = new OrderBookkeeper();
   private readonly positions = new Positions();
-  // Every order we placed, so fills can be attributed after the order leaves the book.
-  private readonly placedSide = new Map<string, { exchangeId: string; side: 'bid' | 'ask'; at: number }>();
+  // Every order we placed, so fills can be attributed after the order leaves the book and orders
+  // with an unseen outcome count against the limits.
+  private readonly placements = new Placements();
   private recentFills: { at: number; exchangeId: string; side: 'bid' | 'ask'; qty: number }[] = [];
   private snapshotAt = 0;
   // Exchange+side pairs whose last placement was rejected outright; skipped until the time given.
@@ -251,7 +252,9 @@ export class Engine {
     if (!stale && this.frozen) log.info('positions confirmed; resuming');
     this.frozen = stale;
 
-    const { desired, arbs, snipes } = this.plan();
+    const { desired, arbs, snipes, confirmSoon } = this.plan();
+    // Unconfirmed shares are holding sizes down; a fresh snapshot frees whatever didn't fill.
+    if (confirmSoon) this.needReconcile = true;
     this.logPlan(desired, arbs);
     this.logSnipes(snipes);
     if (config.live) {
@@ -310,13 +313,14 @@ export class Engine {
     this.recentFills = this.recentFills.filter((f) => f.at > snapshotAt - 120_000);
     this.lastReconcile = Date.now();
     this.lastReconcileOk = this.lastReconcile;
-    for (const [id, p] of this.placedSide) if (p.at < snapshotAt - 3_600_000) this.placedSide.delete(id);
+    // Same listing lag as the open orders: placements just before the snapshot may be missing from it.
+    this.placements.confirm(snapshotAt - 15_000, snapshotAt - 3_600_000);
   }
 
   private onAccount(b: AccountBatch) {
     for (const f of b.fills ?? []) {
       const id = f.orderId === null ? null : String(f.orderId);
-      const placed = id ? this.placedSide.get(id) : undefined;
+      const placed = id ? this.placements.get(id) : undefined;
       if (!placed) {
         this.needReconcile = true;
         continue;
@@ -324,9 +328,12 @@ export class Engine {
       this.orders.fill(id!, f.quantity);
       const executedAt = (f as { executedAt?: string }).executedAt;
       const at = executedAt ? Date.parse(executedAt) : Date.now();
-      this.recentFills.push({ at, exchangeId: placed.exchangeId, side: placed.side, qty: f.quantity });
-      // Fills from before the last REST snapshot are already counted in it.
-      if (at > this.snapshotAt) this.positions.apply(placed.exchangeId, placed.side, f.quantity);
+      const fresh = this.placements.feedFill(id!, f.quantity);
+      if (fresh > 0) {
+        this.recentFills.push({ at, exchangeId: placed.exchangeId, side: placed.side, qty: fresh });
+        // Fills from before the last REST snapshot are already counted in it.
+        if (at > this.snapshotAt) this.positions.apply(placed.exchangeId, placed.side, fresh);
+      }
       log.info('fill', { exchangeId: f.exchangeId, side: placed.side, qty: f.quantity, price: f.price });
     }
     for (const u of b.orderUpdates ?? []) if (!u.open) this.orders.remove(String(u.orderId));
@@ -334,11 +341,12 @@ export class Engine {
 
   // ---- planning (no side effects) ----
 
-  private plan(): { desired: Desired[]; arbs: PlannedArb[]; snipes: PlannedSnipe[] } {
+  private plan(): { desired: Desired[]; arbs: PlannedArb[]; snipes: PlannedSnipe[]; confirmSoon: boolean } {
     const s = config.strategy;
     const desired: Desired[] = [];
     const arbs: PlannedArb[] = [];
     const snipes: PlannedSnipe[] = [];
+    let confirmSoon = false;
     let budget = config.risk.maxGrossCost - this.positions.costBasis;
 
     for (const race of this.active) {
@@ -356,10 +364,16 @@ export class Engine {
       }
       const ext = race.legs.map((l, i) => externalBook(raw[i]!, this.orders.forExchange(l.exchangeId)));
       const netYes = race.legs.map((l) => this.positions.get(l.exchangeId));
+      // Shares that may already have filled without reaching netYes; sized as if they had.
+      const isResting = (id: string) => this.orders.orders.has(id);
+      const pending = {
+        bid: race.legs.map((l) => this.placements.unconfirmed(l.exchangeId, 'bid', isResting)),
+        ask: race.legs.map((l) => this.placements.unconfirmed(l.exchangeId, 'ask', isResting)),
+      };
 
       // A newly listed leg is priced against the race's established legs; its opening orders can
       // sit far outside where those put it.
-      const planned = this.frozen ? [] : this.planSnipes(race, ext, netYes, budget);
+      const planned = this.frozen ? [] : this.planSnipes(race, ext, netYes, pending, budget);
       if (planned.length) {
         snipes.push(...planned);
         budget -= planned.reduce((a, p) => a + p.snipe.quantity * fromTicks(p.snipe.buy === 'yes' ? p.snipe.limitT : TICKS_PER_UNIT - p.snipe.limitT), 0);
@@ -371,7 +385,9 @@ export class Engine {
       const arbReady = (this.arbCooldown.get(race.name) ?? 0) <= Date.now() && !this.needReconcile && !this.frozen;
       const arb = arbReady ? findArb(ext, s.otherMaxTicks, config.arb.minEdgeTicks, config.arb.maxShares) : null;
       if (arb) {
-        const room = netYes.map((q) => (arb.kind === 'sell-all' ? config.risk.maxLegShares + q : config.risk.maxLegShares - q));
+        const room = netYes.map((q, i) =>
+          arb.kind === 'sell-all' ? config.risk.maxLegShares + q - pending.ask[i]! : config.risk.maxLegShares - q - pending.bid[i]!,
+        );
         const cost = arb.legs.reduce((a, l) => a + orderCost(l.side === 'bid' ? 'ask' : 'bid', l.priceT, 1), 0);
         const quantity = Math.floor(Math.min(arb.quantity, ...room, Math.max(0, budget) / cost));
         // Each arb costs several writes (cancels plus the multi-leg), so skip dust.
@@ -389,7 +405,6 @@ export class Engine {
       }
       const fairs = fairValues(touches as Touch[], s.otherMaxTicks);
       const deltas = raceDeltas(netYes);
-      const zeros = netYes.map(() => 0);
 
       race.legs.forEach((leg, i) => {
         const q = quoteLeg(fairs[i]!, touches[i]!, deltas[i]!, s);
@@ -400,8 +415,9 @@ export class Engine {
           // A bid buys back a short, an ask sells down a long: those shrink risk and free capital,
           // so they skip the capital budget and stay allowed while positions are unconfirmed.
           const reduces = side === 'bid' ? netYes[i]! < 0 : netYes[i]! > 0;
-          let size = Math.min(s.quoteSize, maxOrderSize(side, netYes, zeros, i, config.risk));
-          if (reduces) size = Math.min(size, Math.abs(netYes[i]!));
+          let size = Math.min(s.quoteSize, maxOrderSize(side, netYes, pending[side], i, config.risk));
+          if (pending[side][i]! > 0 && size < s.quoteSize) confirmSoon = true;
+          if (reduces) size = Math.min(size, Math.abs(netYes[i]!) - pending[side][i]!);
           if (size < 1 || (this.frozen && !reduces)) continue;
           const cost = orderCost(side, priceT, size);
           if (!reduces) {
@@ -412,10 +428,16 @@ export class Engine {
         }
       });
     }
-    return { desired, arbs, snipes };
+    return { desired, arbs, snipes, confirmSoon };
   }
 
-  private planSnipes(race: Race, ext: ReturnType<typeof externalBook>[], netYes: number[], budget: number): PlannedSnipe[] {
+  private planSnipes(
+    race: Race,
+    ext: ReturnType<typeof externalBook>[],
+    netYes: number[],
+    pending: { bid: number[]; ask: number[] },
+    budget: number,
+  ): PlannedSnipe[] {
     const w = config.watch;
     const now = Date.now();
     const isFresh = (ex: string) => now - (this.fresh.get(ex) ?? -Infinity) < w.snipeWindowMs;
@@ -432,7 +454,7 @@ export class Engine {
         const side = snipe.buy === 'yes' ? 'bid' : 'ask';
         const unitCost = fromTicks(snipe.buy === 'yes' ? snipe.limitT : TICKS_PER_UNIT - snipe.limitT);
         const quantity = Math.floor(
-          Math.min(snipe.quantity, maxOrderSize(side, netYes, netYes.map(() => 0), i, config.risk), Math.max(0, budget) / unitCost),
+          Math.min(snipe.quantity, maxOrderSize(side, netYes, pending[side], i, config.risk), Math.max(0, budget) / unitCost),
         );
         if (quantity < 1) continue;
         // Profit scales down with the size cut; the walk takes the best levels first, so this is conservative.
@@ -534,6 +556,7 @@ export class Engine {
       log.info('arb placed', { race: race.name, kind: arb.kind, qty: arb.quantity, traded });
     } catch (err) {
       log.warn('arb failed', { race: race.name, err: String(err) });
+      if (mayHavePlaced(err)) for (const l of legs) this.unknownOutcome(l);
       this.needReconcile = true;
       return;
     }
@@ -570,11 +593,13 @@ export class Engine {
       const r = await this.api.placeBatch(reqs, Date.parse(expirationDate) - 5_000);
       for (const item of r.results ?? []) {
         if (item.ok) this.track(reqs[item.index]!, item.data as OrderResult & { remainingQuantity?: number }, 'snipe');
+        else if (item.status === 429 || item.status >= 500) this.unknownOutcome(reqs[item.index]!);
         else log.warn('snipe rejected', { exchangeId: reqs[item.index]?.exchangeId, status: item.status, data: item.data });
       }
       log.info('snipes placed', { count: reqs.length });
     } catch (err) {
       log.warn('snipe batch failed', { err: String(err) });
+      if (mayHavePlaced(err)) for (const req of reqs) this.unknownOutcome(req);
     }
     this.needReconcile = true;
   }
@@ -667,7 +692,7 @@ export class Engine {
             this.track(req, item.data as OrderResult & { remainingQuantity?: number }, 'quote');
           } else if (item.status === 429 || item.status >= 500) {
             // Outcome unknown (a 502 may have rested); the listing will tell us.
-            this.needReconcile = true;
+            this.unknownOutcome(req);
           } else {
             log.warn('quote rejected', { exchangeId: req.exchangeId, status: item.status, data: item.data });
             this.cooldown.set(`${req.exchangeId}:${req.side === 'yes' ? 'bid' : 'ask'}`, now + 60_000);
@@ -676,19 +701,37 @@ export class Engine {
         log.debug('quotes placed', { ok, total: reqs.length });
       } catch (err) {
         log.warn('batch failed', { err: String(err) });
+        if (mayHavePlaced(err)) for (const req of reqs) this.unknownOutcome(req);
         this.needReconcile = true;
       }
     };
     await Promise.all(Array.from({ length: batches }, (_, b) => placeChunk(b)));
   }
 
+  // An order that may or may not be on the book (timeout, 5xx, abandoned retry): it counts as
+  // filled against the limits until a snapshot taken after it says otherwise.
+  private unknownOutcome(req: OrderRequest) {
+    this.placements.record(null, { exchangeId: req.exchangeId, side: req.side === 'yes' ? 'bid' : 'ask', quantity: req.quantity, traded: 0, at: Date.now() });
+    this.needReconcile = true;
+  }
+
   private track(req: OrderRequest, data: OrderResult & { remainingQuantity?: number }, kind: OwnOrder['kind']) {
     const id = data.orderId ?? data.id;
-    if (id === undefined || id === null) return;
+    if (id === undefined || id === null) {
+      this.unknownOutcome(req);
+      return;
+    }
     const side: 'bid' | 'ask' = req.side === 'yes' ? 'bid' : 'ask';
     const priceT = side === 'bid' ? toTicks(req.price) : TICKS_PER_UNIT - toTicks(req.price);
-    this.placedSide.set(String(id), { exchangeId: req.exchangeId, side, at: Date.now() });
     const left = data.remainingQuantity ?? req.quantity - (data.quantityTraded ?? 0);
+    const now = Date.now();
+    // Credit a fill on placement now; waiting for the feed or the next snapshot is how one leg
+    // got quoted again and again while every quote filled.
+    const traded = this.placements.record(String(id), { exchangeId: req.exchangeId, side, quantity: req.quantity, traded: req.quantity - left, at: now });
+    if (traded > 0) {
+      this.positions.apply(req.exchangeId, side, traded);
+      this.recentFills.push({ at: now, exchangeId: req.exchangeId, side, qty: traded });
+    }
     if (data.open === false || left <= 0) return;
     this.orders.add({
       id: String(id),
@@ -703,4 +746,10 @@ export class Engine {
       kind,
     });
   }
+}
+
+// A 4xx other than 409 means the request was refused and placed nothing; anything else (timeout,
+// abandoned retry, 5xx, 409 still in flight) may have placed some or all of it.
+function mayHavePlaced(err: unknown): boolean {
+  return !(err instanceof ApiError && err.status >= 400 && err.status < 500 && err.status !== 409);
 }

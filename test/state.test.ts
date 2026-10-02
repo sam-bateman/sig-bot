@@ -1,6 +1,7 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { OrderBookkeeper, Positions, externalBook, remaining, toYes, type OwnOrder } from '../src/state.js';
+import { OrderBookkeeper, Placements, Positions, externalBook, remaining, toYes, type OwnOrder } from '../src/state.js';
+import { maxOrderSize } from '../src/risk.js';
 import type { Position, RestOrder } from '../src/api.js';
 
 const order = (over: Partial<OwnOrder> = {}): OwnOrder => ({
@@ -377,5 +378,121 @@ describe('Positions', () => {
     const p = new Positions();
     p.reconcile([pos({ exchangeId: 'a', lots: [{ side: 'yes', quantity: 10, entryPrice: 0.5 }, { side: 'no', quantity: 10, entryPrice: 0.5 }] })], 0);
     assert.equal(p.get('a'), 0);
+  });
+});
+
+describe('Placements', () => {
+  const none = () => false;
+  const place = (ps: Placements, id: string | null, over: Partial<{ exchangeId: string; side: 'bid' | 'ask'; quantity: number; traded: number; at: number }> = {}) =>
+    ps.record(id, { exchangeId: 'ex1', side: 'ask', quantity: 50, traded: 0, at: 1_000, ...over });
+
+  it('credits a fill reported on placement once', () => {
+    const ps = new Placements();
+    assert.equal(place(ps, 'o1', { traded: 50 }), 50);
+    // The feed later repeats the same fill.
+    assert.equal(ps.feedFill('o1', 50), 0);
+  });
+
+  it('credits only the feed fills beyond what placement reported', () => {
+    const ps = new Placements();
+    place(ps, 'o1', { quantity: 100, traded: 30 });
+    assert.equal(ps.feedFill('o1', 30), 0);
+    assert.equal(ps.feedFill('o1', 50), 50);
+    assert.equal(ps.feedFill('o1', 20), 20);
+  });
+
+  it('caps a placement credit at the order size', () => {
+    const ps = new Placements();
+    assert.equal(place(ps, 'o1', { traded: 80 }), 50);
+    assert.equal(place(ps, 'o2', { traded: -5 }), 0);
+  });
+
+  it('ignores feed fills for orders it never saw', () => {
+    assert.equal(new Placements().feedFill('nope', 10), 0);
+  });
+
+  it('counts orders that left the book uncredited, by exchange and side', () => {
+    const ps = new Placements();
+    place(ps, 'o1');
+    place(ps, 'o2', { side: 'bid' });
+    place(ps, 'o3', { exchangeId: 'ex2' });
+    place(ps, null, { quantity: 20 });
+    assert.equal(ps.unconfirmed('ex1', 'ask', none), 70);
+    assert.equal(ps.unconfirmed('ex1', 'bid', none), 50);
+    assert.equal(ps.unconfirmed('ex2', 'ask', none), 50);
+  });
+
+  it('does not count an order that is still resting', () => {
+    const ps = new Placements();
+    place(ps, 'o1');
+    place(ps, 'o2');
+    assert.equal(ps.unconfirmed('ex1', 'ask', (id) => id === 'o2'), 50);
+  });
+
+  it('does not count shares already credited', () => {
+    const ps = new Placements();
+    place(ps, 'o1', { traded: 50 });
+    place(ps, 'o2', { traded: 20 });
+    assert.equal(ps.unconfirmed('ex1', 'ask', none), 30);
+  });
+
+  it('stops counting placements a snapshot covers, but still attributes their feed fills', () => {
+    const ps = new Placements();
+    place(ps, 'o1', { at: 1_000 });
+    place(ps, null, { at: 1_000 });
+    place(ps, 'o2', { at: 5_000 });
+    ps.confirm(2_000, 0);
+    assert.equal(ps.unconfirmed('ex1', 'ask', none), 50);
+    assert.equal(ps.get('o1')?.exchangeId, 'ex1');
+    assert.equal(ps.feedFill('o1', 10), 10);
+  });
+
+  it('never moves the confirmation point backwards', () => {
+    const ps = new Placements();
+    place(ps, 'o1', { at: 3_000 });
+    ps.confirm(5_000, 0);
+    ps.confirm(2_000, 0);
+    assert.equal(ps.unconfirmed('ex1', 'ask', none), 0);
+  });
+
+  it('forgets placements older than the cutoff', () => {
+    const ps = new Placements();
+    place(ps, 'o1', { at: 1_000 });
+    ps.confirm(2_000, 1_500);
+    assert.equal(ps.get('o1'), undefined);
+  });
+
+  // The overnight breach: an ask leg near its cap, every 50-share quote filling on placement, no
+  // feed and no snapshot in between. Sizing must stop at the cap, not a quote per cycle past it.
+  it('keeps a leg inside its cap when every quote fills and positions lag', () => {
+    const limits = { maxLegShares: 3_000, maxRaceDelta: 1e9 };
+    const ps = new Placements();
+    const snapshotNet = -2_853; // what REST last said
+    let net = snapshotNet; // what the engine credits locally
+    let truth = snapshotNet; // what the exchange holds
+    for (let cycle = 0; cycle < 12; cycle++) {
+      const pending = ps.unconfirmed('ex1', 'ask', none);
+      const size = Math.min(50, maxOrderSize('ask', [net, 0], [pending, 0], 0, limits));
+      if (size < 1) break;
+      truth -= size;
+      net -= place(ps, `o${cycle}`, { quantity: size, traded: size, at: 10_000 + cycle });
+    }
+    assert.equal(truth, -3_000);
+    assert.equal(net, truth);
+  });
+
+  it('keeps a leg inside its cap when quotes fill unseen after placement', () => {
+    const limits = { maxLegShares: 3_000, maxRaceDelta: 1e9 };
+    const ps = new Placements();
+    const net = -2_853;
+    let truth = net;
+    for (let cycle = 0; cycle < 12; cycle++) {
+      // Resting on placement, then picked off with no feed: it just disappears from our book.
+      const size = Math.min(50, maxOrderSize('ask', [net, 0], [ps.unconfirmed('ex1', 'ask', none), 0], 0, limits));
+      if (size < 1) break;
+      truth -= size;
+      place(ps, `o${cycle}`, { quantity: size, at: 10_000 + cycle });
+    }
+    assert.ok(truth >= -3_000, `leg reached ${truth}`);
   });
 });
