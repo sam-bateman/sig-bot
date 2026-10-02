@@ -115,22 +115,43 @@ export class ApiError extends Error {
   }
 }
 
+// The call ran out of time; it may still have executed in part, so reconcile before trusting local state.
+export class DeadlineError extends Error {
+  constructor(readonly path: string) {
+    super(`${path}: deadline passed, not retrying`);
+  }
+}
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export class Api {
   readonly reads = new TokenBucket(config.limits.readsPerMin);
   readonly writes = new TokenBucket(config.limits.writesPerMin);
 
-  private async request<T>(method: string, path: string, opts: { query?: Record<string, unknown>; body?: unknown } = {}): Promise<T> {
+  // `deadline` (epoch ms) bounds the whole call, retries included: past it, the request is abandoned
+  // with DeadlineError rather than resent. Use it for payloads that go stale, like expiring quotes.
+  private async request<T>(
+    method: string,
+    path: string,
+    opts: { query?: Record<string, unknown>; body?: unknown; deadline?: number } = {},
+  ): Promise<T> {
     const isRead = method === 'GET';
     const bucket = isRead ? this.reads : this.writes;
     const qs = new URLSearchParams();
     for (const [k, v] of Object.entries(opts.query ?? {})) if (v !== undefined && v !== null) qs.set(k, String(v));
     const url = `${config.baseUrl}${path}${qs.size ? `?${qs}` : ''}`;
 
+    const deadline = opts.deadline ?? Infinity;
+    const wait = async (ms: number) => {
+      if (Date.now() + ms >= deadline) throw new DeadlineError(path);
+      await sleep(ms);
+    };
+
     // Every retry below reuses the same body, so idempotency keys carry over.
     for (let attempt = 0; ; attempt++) {
       await bucket.take();
+      const left = deadline - Date.now();
+      if (left <= 0) throw new DeadlineError(path);
       let res: Response;
       try {
         res = await fetch(url, {
@@ -140,12 +161,12 @@ export class Api {
             ...(opts.body !== undefined ? { 'Content-Type': 'application/json' } : {}),
           },
           body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
-          signal: AbortSignal.timeout(30_000),
+          signal: AbortSignal.timeout(Math.min(30_000, left)),
         });
       } catch (err) {
         if (attempt >= 4) throw err;
         log.warn('network error, retrying', { path, attempt, err: String(err) });
-        await sleep(backoff(attempt));
+        await wait(backoff(attempt));
         continue;
       }
 
@@ -160,6 +181,7 @@ export class Api {
 
       if (res.status === 429) {
         bucket.pause(retryAfter || 60_000);
+        if (Date.now() + (retryAfter || 60_000) >= deadline) throw new DeadlineError(path);
         if (attempt < 3) {
           log.warn('rate limited', { path, code, retryAfterMs: retryAfter || 60_000 });
           continue;
@@ -168,9 +190,9 @@ export class Api {
         (res.status === 503 || res.status === 502 || code === 'REQUEST_IN_FLIGHT') &&
         attempt < 4
       ) {
-        const wait = code === 'REQUEST_IN_FLIGHT' ? 90_000 : Math.max(retryAfter, backoff(attempt));
-        log.warn('transient error, retrying', { path, code, attempt, waitMs: wait });
-        await sleep(wait);
+        const ms = code === 'REQUEST_IN_FLIGHT' ? 90_000 : Math.max(retryAfter, backoff(attempt));
+        log.warn('transient error, retrying', { path, code, attempt, waitMs: ms });
+        await wait(ms);
         continue;
       }
       throw new ApiError(res.status, code, err?.message ?? text.slice(0, 300), err?.details ?? json);
@@ -254,8 +276,11 @@ export class Api {
 
   // ---- writes ----
 
-  placeBatch(orders: OrderRequest[]) {
-    return this.post<{ results: BatchItem[] }>('/orders/batch', { idempotencyKey: randomUUID(), orders });
+  placeBatch(orders: OrderRequest[], deadline?: number) {
+    return this.request<{ results: BatchItem[] }>('POST', '/orders/batch', {
+      body: { idempotencyKey: randomUUID(), orders },
+      deadline,
+    });
   }
 
   placeMultiLeg(legs: OrderRequest[]) {
