@@ -1,0 +1,26 @@
+{
+  "name": "sig-bot",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Pair market maker for the Susquehanna Predictions Cup (Super Market API)",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "bot": "tsx src/main.ts",
+    "scan": "tsx src/scripts/scan.ts",
+    "status": "tsx src/scripts/status.ts",
+    "kill": "tsx src/scripts/kill.ts",
+    "test": "tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.117.2"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.4",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
