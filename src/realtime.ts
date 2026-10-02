@@ -56,6 +56,7 @@ const REFRESH_RETRY_MS = [30_000, 60_000, 120_000, 300_000];
 
 export class Feed {
   private client: SupabaseClient | null = null;
+  private token = '';
   private channels: RealtimeChannel[] = [];
   private lastRevision = new Map<string, number>();
   private refreshTimer: NodeJS.Timeout | null = null;
@@ -72,26 +73,15 @@ export class Feed {
 
   async start(marketIds: string[]) {
     const tok = await this.api.realtimeToken();
+    this.token = tok.token;
+    // supabase-js re-reads the token from this callback on every heartbeat. Without it the callback
+    // falls back to the anon key, and channels joined after the first heartbeat are refused.
     this.client = createClient(tok.supabaseUrl, tok.anonKey, {
-      auth: { persistSession: false, autoRefreshToken: false },
+      accessToken: async () => this.token,
     });
     await this.client.realtime.setAuth(tok.token);
 
-    for (const marketId of marketIds) {
-      const topic = `tournament:${this.tournamentId}:market:${marketId}`;
-      const ch = this.client
-        .channel(topic, { config: { private: true } })
-        .on('broadcast', { event: 'market_batch' }, ({ payload }) => this.onMarketBatch(topic, marketId, payload as MarketBatch))
-        .on('broadcast', { event: 'book_dirty' }, () => this.handlers.onMarketResync(marketId))
-        .on('broadcast', { event: 'market_settled' }, () => this.handlers.onMarketSettled(marketId))
-        .subscribe((status, err) =>
-          this.onStatus(topic, status, err, () => this.handlers.onMarketResync(marketId), (up) => {
-            if (up) this.liveMarkets.add(marketId);
-            else this.liveMarkets.delete(marketId);
-          }),
-        );
-      this.channels.push(ch);
-    }
+    this.addMarkets(marketIds);
 
     const userTopic = tok.channels.user;
     const user = this.client
@@ -105,6 +95,28 @@ export class Feed {
     this.channels.push(user);
 
     this.scheduleRefresh(config.timing.tokenRefreshMs);
+  }
+
+  // Subscribe to more tournament markets on the open connection (e.g. ones listed after startup).
+  addMarkets(marketIds: string[]) {
+    if (!this.client) throw new Error('Feed.addMarkets called before start');
+    const subscribed = new Set(this.channels.map((c) => c.topic.replace(/^realtime:/, '')));
+    for (const marketId of marketIds) {
+      const topic = `tournament:${this.tournamentId}:market:${marketId}`;
+      if (subscribed.has(topic)) continue;
+      const ch = this.client
+        .channel(topic, { config: { private: true } })
+        .on('broadcast', { event: 'market_batch' }, ({ payload }) => this.onMarketBatch(topic, marketId, payload as MarketBatch))
+        .on('broadcast', { event: 'book_dirty' }, () => this.handlers.onMarketResync(marketId))
+        .on('broadcast', { event: 'market_settled' }, () => this.handlers.onMarketSettled(marketId))
+        .subscribe((status, err) =>
+          this.onStatus(topic, status, err, () => this.handlers.onMarketResync(marketId), (up) => {
+            if (up) this.liveMarkets.add(marketId);
+            else this.liveMarkets.delete(marketId);
+          }),
+        );
+      this.channels.push(ch);
+    }
   }
 
   // True while the market's tournament channel is subscribed. A token refresh re-authorizes in place
@@ -124,7 +136,7 @@ export class Feed {
       this.lastRevision.delete(topic);
       resync(); // initial state, and recovery after any reconnect
     } else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
-      log.warn('realtime channel down', { topic, status, err: err?.message });
+      if (!this.stopped) log.warn('realtime channel down', { topic, status, err: err?.message });
       setLive(false);
       this.lastRevision.delete(topic);
     }
@@ -174,6 +186,7 @@ export class Feed {
     this.refreshTimer = null;
     try {
       const tok = await this.api.realtimeToken();
+      this.token = tok.token;
       await this.client?.realtime.setAuth(tok.token);
       log.info('realtime token refreshed');
       this.refreshFailures = 0;

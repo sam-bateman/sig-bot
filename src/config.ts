@@ -61,6 +61,17 @@ export const config = {
     maxGrossCost: num('SIG_MAX_GROSS_COST', 40_000),
   },
 
+  watch: {
+    pollMs: num('SIG_WATCH_POLL_MS', 120_000),
+    // How long after listing a market is treated as new and eligible for sniping.
+    snipeWindowMs: num('SIG_SNIPE_WINDOW_MS', 30 * 60_000),
+    // Minimum distance outside the implied band before taking an order, in ticks.
+    snipeEdgeTicks: num('SIG_SNIPE_EDGE_TICKS', 6),
+    snipeMaxShares: num('SIG_SNIPE_MAX_SHARES', 2_000),
+    // Comma-separated market IDs to hide at startup so the first poll "discovers" them.
+    simulateNew: (process.env.SIG_WATCH_SIMULATE_NEW ?? '').split(',').filter(Boolean),
+  },
+
   arb: {
     minEdgeTicks: num('SIG_ARB_MIN_EDGE_TICKS', 1),
     maxShares: num('SIG_ARB_MAX_SHARES', 2_000),

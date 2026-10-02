@@ -8,6 +8,8 @@ import { externalBook, OrderBookkeeper, Positions, remaining, type OwnOrder } fr
 import {
   fairValues,
   findArb,
+  findSnipes,
+  impliedBand,
   fromTicks,
   quoteLeg,
   raceDeltas,
@@ -15,9 +17,11 @@ import {
   toTicks,
   touch,
   type Arb,
+  type Snipe,
   type Touch,
 } from './strategy.js';
-import { buildRaces, type Race } from './universe.js';
+import { buildRaces, parseLeg, type Leg, type Race } from './universe.js';
+import { MarketWatcher } from './watcher.js';
 
 interface Desired {
   race: string;
@@ -31,6 +35,13 @@ interface Desired {
 interface PlannedArb {
   race: Race;
   arb: Arb;
+}
+
+interface PlannedSnipe {
+  race: Race;
+  leg: Leg;
+  snipe: Snipe;
+  band: { loT: number; hiT: number };
 }
 
 const BATCH_SIZE = 25;
@@ -54,6 +65,12 @@ export class Engine {
   private tournament!: Tournament;
   private feed!: Feed;
   private active: Race[] = [];
+  // Every race seen, including ones with a single leg so far, keyed by name.
+  private readonly allRaces = new Map<string, Race>();
+  // Exchanges listed after startup, with when we first saw them.
+  private readonly fresh = new Map<string, number>();
+  private watcher!: MarketWatcher;
+  private lastWatch = Date.now();
   private needReconcile = true;
   private lastReconcile = 0;
   private lastPlanKey = new Map<string, string>();
@@ -70,15 +87,16 @@ export class Engine {
       mode: config.live ? 'LIVE' : 'dry-run',
     });
 
-    const markets = await this.api.tournamentMarkets(config.tournamentSlug);
+    // Markets hidden at startup are "discovered" by the first watcher poll; for dry-run testing.
+    const hidden = new Set(config.watch.simulateNew);
+    const markets = (await this.api.tournamentMarkets(config.tournamentSlug)).filter((m) => !hidden.has(m.id));
+    for (const m of markets) this.addLeg(m);
+    this.watcher = new MarketWatcher(this.api, config.tournamentSlug, markets);
     const { races, unmatched } = buildRaces(markets);
     if (unmatched.length) log.info('markets not in a race (ignored)', { titles: unmatched.map((m) => m.title) });
-    this.active = await this.selectRaces(races);
-    for (const r of this.active)
-      for (const l of r.legs) {
-        this.marketToExchange.set(l.marketId, l.exchangeId);
-        this.exchangeToMarket.set(l.exchangeId, l.marketId);
-      }
+    // buildRaces makes fresh race objects; quote the canonical ones so later legs show up.
+    this.active = (await this.selectRaces(races)).map((r) => this.allRaces.get(r.name)!);
+    for (const r of this.active) this.mapLegs(r);
     log.info('quoting races', { races: this.active.map((r) => r.name) });
 
     if (config.live) {
@@ -123,6 +141,43 @@ export class Engine {
     return scored.slice(0, config.strategy.maxRaces).map((s) => s.race);
   }
 
+  private addLeg(m: Parameters<typeof parseLeg>[0]): { race: Race; leg: Leg } | null {
+    const parsed = parseLeg(m);
+    if (!parsed) return null;
+    const race = this.allRaces.get(parsed.name) ?? { name: parsed.name, legs: [] };
+    if (race.legs.some((l) => l.party === parsed.leg.party)) return null;
+    race.legs.push(parsed.leg);
+    race.legs.sort((a, b) => 'RDI'.indexOf(a.party) - 'RDI'.indexOf(b.party));
+    this.allRaces.set(parsed.name, race);
+    return { race, leg: parsed.leg };
+  }
+
+  private mapLegs(race: Race) {
+    for (const l of race.legs) {
+      this.marketToExchange.set(l.marketId, l.exchangeId);
+      this.exchangeToMarket.set(l.exchangeId, l.marketId);
+    }
+  }
+
+  private async watch() {
+    const listed = await this.watcher.poll();
+    for (const m of listed) {
+      const added = this.addLeg(m);
+      if (!added) {
+        log.info('new market (not a party market; ignored)', { id: m.id, title: m.title });
+        continue;
+      }
+      const { race, leg } = added;
+      this.fresh.set(leg.exchangeId, Date.now());
+      log.info('new market listed', { race: race.name, party: leg.party, marketId: leg.marketId, legs: race.legs.length });
+      if (race.legs.length < 2) continue; // nothing to price it against yet
+      if (!this.active.includes(race)) this.active.push(race);
+      this.mapLegs(race);
+      this.feed.addMarkets(race.legs.map((l) => l.marketId));
+      for (const l of race.legs) this.resyncQueue.add(l.exchangeId);
+    }
+  }
+
   async run() {
     const stop = async () => {
       if (!this.running) process.exit(1);
@@ -161,6 +216,14 @@ export class Engine {
       this.books.clearExpiry(ex);
       this.resyncQueue.add(ex);
     }
+    if (now - this.lastWatch > config.watch.pollMs) {
+      this.lastWatch = now;
+      try {
+        await this.watch();
+      } catch (err) {
+        log.warn('market watch failed', { err: String(err) });
+      }
+    }
     await this.drainResyncs();
     log.debug('cycle', { resyncPending: this.resyncQueue.size, reads: this.api.reads.available() });
     if (this.needReconcile || now - this.lastReconcile > config.timing.reconcileMs) {
@@ -171,9 +234,14 @@ export class Engine {
       }
     }
 
-    const { desired, arbs } = this.plan();
+    const { desired, arbs, snipes } = this.plan();
     this.logPlan(desired, arbs);
+    this.logSnipes(snipes);
     if (config.live) {
+      if (snipes.length) {
+        await this.executeSnipes(snipes);
+        return;
+      }
       if (arbs.length) {
         // Arb fills change positions, so quotes are planned again next cycle from fresh state.
         for (const a of arbs) await this.executeArb(a);
@@ -248,10 +316,11 @@ export class Engine {
 
   // ---- planning (no side effects) ----
 
-  private plan(): { desired: Desired[]; arbs: PlannedArb[] } {
+  private plan(): { desired: Desired[]; arbs: PlannedArb[]; snipes: PlannedSnipe[] } {
     const s = config.strategy;
     const desired: Desired[] = [];
     const arbs: PlannedArb[] = [];
+    const snipes: PlannedSnipe[] = [];
     let budget = config.risk.maxGrossCost - this.positions.costBasis;
 
     for (const race of this.active) {
@@ -269,6 +338,15 @@ export class Engine {
       }
       const ext = race.legs.map((l, i) => externalBook(raw[i]!, this.orders.forExchange(l.exchangeId)));
       const netYes = race.legs.map((l) => this.positions.get(l.exchangeId));
+
+      // A newly listed leg is priced against the race's established legs; its opening orders can
+      // sit far outside where those put it.
+      const planned = this.planSnipes(race, ext, netYes, budget);
+      if (planned.length) {
+        snipes.push(...planned);
+        budget -= planned.reduce((a, p) => a + p.snipe.quantity * fromTicks(p.snipe.buy === 'yes' ? p.snipe.limitT : TICKS_PER_UNIT - p.snipe.limitT), 0);
+        continue;
+      }
 
       const arb = findArb(ext, s.otherMaxTicks, config.arb.minEdgeTicks, config.arb.maxShares);
       if (arb) {
@@ -307,7 +385,48 @@ export class Engine {
         }
       });
     }
-    return { desired, arbs };
+    return { desired, arbs, snipes };
+  }
+
+  private planSnipes(race: Race, ext: ReturnType<typeof externalBook>[], netYes: number[], budget: number): PlannedSnipe[] {
+    const w = config.watch;
+    const now = Date.now();
+    const isFresh = (ex: string) => now - (this.fresh.get(ex) ?? -Infinity) < w.snipeWindowMs;
+    const out: PlannedSnipe[] = [];
+    race.legs.forEach((leg, i) => {
+      if (!isFresh(leg.exchangeId)) return;
+      // The reference must be established legs; a race that is all new has no anchor.
+      const others = race.legs.map((l, j) => ({ l, j })).filter(({ j }) => j !== i);
+      if (others.some(({ l }) => isFresh(l.exchangeId))) return;
+      const touches = others.map(({ j }) => touch(ext[j]!, config.strategy.minFairLevelQty));
+      if (touches.some((t) => !t || t.askT - t.bidT > config.strategy.maxFairSpreadTicks)) return;
+      const band = impliedBand(touches.map((t) => (t!.bidT + t!.askT) / 2), config.strategy.otherMaxTicks);
+      for (const snipe of findSnipes(ext[i]!, band, w.snipeEdgeTicks, w.snipeMaxShares)) {
+        const side = snipe.buy === 'yes' ? 'bid' : 'ask';
+        const unitCost = fromTicks(snipe.buy === 'yes' ? snipe.limitT : TICKS_PER_UNIT - snipe.limitT);
+        const quantity = Math.floor(
+          Math.min(snipe.quantity, maxOrderSize(side, netYes, netYes.map(() => 0), i, config.risk), Math.max(0, budget) / unitCost),
+        );
+        if (quantity < 1) continue;
+        // Profit scales down with the size cut; the walk takes the best levels first, so this is conservative.
+        out.push({ race, leg, band, snipe: { ...snipe, quantity, expectedProfit: (snipe.expectedProfit * quantity) / snipe.quantity } });
+      }
+    });
+    return out;
+  }
+
+  private logSnipes(snipes: PlannedSnipe[]) {
+    for (const { race, leg, snipe, band } of snipes) {
+      log.info(config.live ? 'snipe' : 'snipe (dry-run)', {
+        race: race.name,
+        party: leg.party,
+        buy: snipe.buy,
+        upToYesPrice: fromTicks(snipe.limitT),
+        qty: snipe.quantity,
+        band: [fromTicks(band.loT), fromTicks(band.hiT)],
+        expectedProfit: +snipe.expectedProfit.toFixed(2),
+      });
+    }
   }
 
   private logPlan(desired: Desired[], arbs: PlannedArb[]) {
@@ -405,6 +524,32 @@ export class Engine {
     }
   }
 
+  private async executeSnipes(snipes: PlannedSnipe[]) {
+    if (this.api.writes.available() < 1) return;
+    // Short expiry: whatever isn't taken immediately shouldn't rest as a stale order.
+    const expirationDate = new Date(Date.now() + config.arb.ttlSec * 1000).toISOString();
+    const reqs: OrderRequest[] = snipes.map(({ leg, snipe }) => ({
+      exchangeId: leg.exchangeId,
+      side: snipe.buy,
+      action: 'buy',
+      quantity: snipe.quantity,
+      price: fromTicks(snipe.buy === 'yes' ? snipe.limitT : TICKS_PER_UNIT - snipe.limitT),
+      expirationDate,
+      tournamentId: this.tournament.id,
+    }));
+    try {
+      const r = await this.api.placeBatch(reqs);
+      for (const item of r.results ?? []) {
+        if (item.ok) this.track(reqs[item.index]!, item.data as OrderResult & { remainingQuantity?: number }, 'snipe');
+        else log.warn('snipe rejected', { exchangeId: reqs[item.index]?.exchangeId, status: item.status, data: item.data });
+      }
+      log.info('snipes placed', { count: reqs.length });
+    } catch (err) {
+      log.warn('snipe batch failed', { err: String(err) });
+    }
+    this.needReconcile = true;
+  }
+
   private async executeQuotes(desired: Desired[]) {
     const s = config.strategy;
     const now = Date.now();
@@ -481,7 +626,8 @@ export class Engine {
         tournamentId: this.tournament.id,
       }));
       try {
-        const r = await this.api.placeBatch(reqs);
+        // Give up once the quotes would land with under 10s to live; reconcile picks up any that rested.
+        const r = await this.api.placeBatch(reqs, Date.parse(expirationDate) - 10_000);
         let ok = 0;
         for (const item of r.results ?? []) {
           const req = reqs[item.index]!;

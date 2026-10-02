@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildRaces } from '../src/universe.js';
+import { buildRaces, parseLeg } from '../src/universe.js';
 import type { Market } from '../src/api.js';
 
 let n = 0;
@@ -140,5 +140,95 @@ describe('buildRaces', () => {
       party('Democratic', 'Mid'),
     ]);
     assert.deepEqual(races.map((r) => r.name), ['Alpha', 'Mid', 'Zed']);
+  });
+});
+
+describe('parseLeg', () => {
+  it('parses Republican party market', () => {
+    const m = party('Republican', 'Texas Senate race');
+    const result = parseLeg(m);
+    assert.ok(result);
+    assert.equal(result.name, 'Texas Senate race');
+    assert.equal(result.leg.party, 'R');
+    assert.equal(result.leg.marketId, m.id);
+    assert.equal(result.leg.exchangeId, m.exchanges[0]!.id);
+    assert.equal(result.leg.title, m.title);
+  });
+
+  it('parses Democratic party market', () => {
+    const m = party('Democratic', 'Ohio House race');
+    const result = parseLeg(m);
+    assert.ok(result);
+    assert.equal(result.leg.party, 'D');
+  });
+
+  it('parses Independent party market', () => {
+    const m = party('Independent', 'Maine Senate race');
+    const result = parseLeg(m);
+    assert.ok(result);
+    assert.equal(result.leg.party, 'I');
+  });
+
+  it('returns null for non-matching title', () => {
+    const m = market('Will it rain tomorrow?');
+    assert.equal(parseLeg(m), null);
+  });
+
+  it('returns null for title with wrong case', () => {
+    const m = market('will the republican party win the Texas Senate?');
+    assert.equal(parseLeg(m), null);
+  });
+
+  it('returns null for title missing question mark', () => {
+    const m = market('Will the Republican Party win the Texas Senate race');
+    assert.equal(parseLeg(m), null);
+  });
+
+  it('returns null for wrong party name', () => {
+    const m = market('Will the Green Party win the Texas Senate race?');
+    assert.equal(parseLeg(m), null);
+  });
+
+  it('returns null for closed market', () => {
+    const m = party('Republican', 'Texas Senate race', { status: 'closed' });
+    assert.equal(parseLeg(m), null);
+  });
+
+  it('returns null for resolved market', () => {
+    const m = party('Democratic', 'Texas Senate race', { status: 'resolved' });
+    assert.equal(parseLeg(m), null);
+  });
+
+  it('returns null for zero exchanges', () => {
+    const m = party('Republican', 'Texas Senate race', { exchanges: [] });
+    assert.equal(parseLeg(m), null);
+  });
+
+  it('returns null for multiple exchanges', () => {
+    const m = party('Republican', 'Texas Senate race', {
+      exchanges: [
+        { id: 'e1', option: 'Yes', latestPrice: null },
+        { id: 'e2', option: 'No', latestPrice: null },
+      ],
+    });
+    assert.equal(parseLeg(m), null);
+  });
+
+  it('captures race name with punctuation and digits', () => {
+    const m = market('Will the Republican Party win the NY-12 House race (special)?', {
+      exchanges: [{ id: 'e1', option: 'Yes', latestPrice: null }],
+    });
+    const result = parseLeg(m);
+    assert.ok(result);
+    assert.equal(result.name, 'NY-12 House race (special)');
+  });
+
+  it('leg carries the correct market and exchange ids', () => {
+    n = 100;
+    const m = party('Republican', 'Test Race');
+    const result = parseLeg(m);
+    assert.ok(result);
+    assert.equal(result.leg.marketId, 'm101');
+    assert.equal(result.leg.exchangeId, 'e101');
   });
 });

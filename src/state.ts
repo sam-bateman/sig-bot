@@ -16,7 +16,7 @@ export interface OwnOrder {
   feedFilled: number;
   placedAt: number; // ms epoch; 0 when learned from REST
   expiresAt: number; // ms epoch; Infinity when unknown
-  kind: 'quote' | 'arb';
+  kind: 'quote' | 'arb' | 'snipe';
 }
 
 export const remaining = (o: OwnOrder) => o.quantity - o.filled;

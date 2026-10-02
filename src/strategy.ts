@@ -115,3 +115,40 @@ export function raceScore(fairs: number[]): number {
   const top = Math.max(...fairs);
   return Math.abs(top - TICKS_PER_UNIT / 2);
 }
+
+// Where one leg must trade given the other legs' fair values: every leg together sums to between
+// 1 - otherMax and 1, so this leg sits between 1 - otherMax - sum(others) and 1 - sum(others).
+export function impliedBand(otherFairs: number[], otherMaxTicks: number): { loT: number; hiT: number } {
+  const sum = otherFairs.reduce((a, b) => a + b, 0);
+  return { loT: TICKS_PER_UNIT - otherMaxTicks - sum, hiT: TICKS_PER_UNIT - sum };
+}
+
+export interface Snipe {
+  buy: 'yes' | 'no';
+  limitT: number; // YES ticks of the worst level taken; better levels fill at their own price
+  quantity: number;
+  expectedProfit: number; // in currency units, measured against the near edge of the band
+}
+
+// Resting orders on a leg priced well outside its implied band, e.g. a newly listed market whose
+// opening orders disagree with the established markets in the same race. Asks below the band are
+// bought as YES; bids above it are sold to, as a NO buy. Walks levels up to maxShares.
+export function findSnipes(book: TickBook, band: { loT: number; hiT: number }, edgeTicks: number, maxShares: number): Snipe[] {
+  const out: Snipe[] = [];
+  const walk = (levels: TickLevel[], ok: (p: number) => boolean, gain: (p: number) => number, buy: Snipe['buy']) => {
+    let quantity = 0;
+    let profit = 0;
+    let limitT = 0;
+    for (const l of levels) {
+      if (!ok(l.priceT) || quantity >= maxShares) break;
+      const q = Math.min(l.quantity, maxShares - quantity);
+      quantity += q;
+      profit += (q * gain(l.priceT)) / TICKS_PER_UNIT;
+      limitT = l.priceT;
+    }
+    if (quantity > 0) out.push({ buy, limitT, quantity, expectedProfit: profit });
+  };
+  walk(book.asks, (p) => p <= band.loT - edgeTicks, (p) => band.loT - p, 'yes');
+  walk(book.bids, (p) => p >= band.hiT + edgeTicks, (p) => p - band.hiT, 'no');
+  return out;
+}

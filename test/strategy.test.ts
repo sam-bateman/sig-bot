@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import {
   findArb,
   fairValues,
+  findSnipes,
   fromTicks,
+  impliedBand,
   quoteLeg,
   raceDeltas,
   raceScore,
@@ -398,5 +400,138 @@ describe('raceScore', () => {
 
   it('uses the top leg regardless of order', () => {
     assert.equal(raceScore([30, 130, 30]), raceScore([130, 30, 30]));
+  });
+});
+
+describe('impliedBand', () => {
+  it('computes band for a single other leg with otherMax 0', () => {
+    const band = impliedBand([100], 0);
+    assert.deepEqual(band, { loT: 100, hiT: 100 });
+  });
+
+  it('computes band for a single other leg with otherMax 4', () => {
+    const band = impliedBand([100], 4);
+    assert.deepEqual(band, { loT: 96, hiT: 100 });
+  });
+
+  it('computes band for two other legs summing to 180, otherMax 0', () => {
+    const band = impliedBand([90, 90], 0);
+    assert.deepEqual(band, { loT: 20, hiT: 20 });
+  });
+
+  it('computes band for two other legs summing to 180, otherMax 4', () => {
+    const band = impliedBand([90, 90], 4);
+    assert.deepEqual(band, { loT: 16, hiT: 20 });
+  });
+
+  it('handles empty otherFairs', () => {
+    const band = impliedBand([], 0);
+    assert.deepEqual(band, { loT: 200, hiT: 200 });
+  });
+
+  it('handles empty otherFairs with otherMax 4', () => {
+    const band = impliedBand([], 4);
+    assert.deepEqual(band, { loT: 196, hiT: 200 });
+  });
+
+  it('computes band for two legs with different values: 100 + 50 = 150, otherMax 4', () => {
+    const band = impliedBand([100, 50], 4);
+    assert.deepEqual(band, { loT: 46, hiT: 50 });
+  });
+});
+
+describe('findSnipes', () => {
+  it('returns empty array when book is empty', () => {
+    const snipes = findSnipes(book([], []), { loT: 95, hiT: 105 }, 1, 1000);
+    assert.deepEqual(snipes, []);
+  });
+
+  it('returns empty array when no snipes exist (book inside band)', () => {
+    const snipes = findSnipes(book([[100, 100]], [[100, 100]]), { loT: 95, hiT: 105 }, 1, 1000);
+    assert.deepEqual(snipes, []);
+  });
+
+  it('finds cheap asks below band.loT - edge', () => {
+    const b = book([], [[90, 100]]);
+    const band = { loT: 100, hiT: 110 };
+    const snipes = findSnipes(b, band, 2, 1000);
+    assert.equal(snipes.length, 1);
+    assert.equal(snipes[0]!.buy, 'yes');
+    assert.equal(snipes[0]!.limitT, 90);
+    assert.equal(snipes[0]!.quantity, 100);
+    // gain = band.loT - priceT = 100 - 90 = 10 ticks; profit = 100 * 10 / 200 = 5
+    assert.ok(Math.abs(snipes[0]!.expectedProfit - 5) < 1e-9);
+  });
+
+  it('finds expensive bids above band.hiT + edge', () => {
+    const b = book([[120, 100]], []);
+    const band = { loT: 90, hiT: 100 };
+    const snipes = findSnipes(b, band, 2, 1000);
+    assert.equal(snipes.length, 1);
+    assert.equal(snipes[0]!.buy, 'no');
+    assert.equal(snipes[0]!.limitT, 120);
+    assert.equal(snipes[0]!.quantity, 100);
+    // gain = priceT - band.hiT = 120 - 100 = 20 ticks; profit = 100 * 20 / 200 = 10
+    assert.ok(Math.abs(snipes[0]!.expectedProfit - 10) < 1e-9);
+  });
+
+  it('includes level exactly at threshold', () => {
+    const b = book([], [[93, 50]]);
+    const band = { loT: 100, hiT: 110 };
+    const snipes = findSnipes(b, band, 3, 1000);
+    assert.equal(snipes.length, 1);
+    assert.equal(snipes[0]!.quantity, 50);
+    // gain = 100 - 93 = 7; profit = 50 * 7 / 200 = 1.75
+    assert.ok(Math.abs(snipes[0]!.expectedProfit - 1.75) < 1e-9);
+  });
+
+  it('excludes level one tick inside threshold', () => {
+    const b = book([], [[98, 50]]);
+    const band = { loT: 100, hiT: 110 };
+    const snipes = findSnipes(b, band, 3, 1000);
+    assert.deepEqual(snipes, []);
+  });
+
+  it('walks multiple ask levels and stops at maxShares', () => {
+    const b = book([], [[90, 100], [91, 100], [92, 100]]);
+    const band = { loT: 100, hiT: 110 };
+    const snipes = findSnipes(b, band, 1, 250);
+    assert.equal(snipes.length, 1);
+    assert.equal(snipes[0]!.buy, 'yes');
+    assert.equal(snipes[0]!.quantity, 250);
+    assert.equal(snipes[0]!.limitT, 92);
+    // First 100 @ 90 gains 10 ea: 1000 ticks; next 100 @ 91 gains 9 ea: 900 ticks; partial 50 @ 92 gains 8 ea: 400 ticks
+    // Total: 2300 ticks = 2300 / 200 = 11.5
+    assert.ok(Math.abs(snipes[0]!.expectedProfit - 11.5) < 1e-9);
+  });
+
+  it('truncates mid-level at maxShares', () => {
+    const b = book([], [[95, 1000]]);
+    const band = { loT: 100, hiT: 110 };
+    const snipes = findSnipes(b, band, 0, 75);
+    assert.equal(snipes.length, 1);
+    assert.equal(snipes[0]!.quantity, 75);
+    assert.equal(snipes[0]!.limitT, 95);
+  });
+
+  it('finds snipes on both bid and ask sides simultaneously', () => {
+    const b = book([[115, 100]], [[85, 100]]);
+    const band = { loT: 100, hiT: 110 };
+    const snipes = findSnipes(b, band, 3, 1000);
+    assert.equal(snipes.length, 2);
+    const buys = snipes.filter((s) => s.buy === 'yes');
+    const sells = snipes.filter((s) => s.buy === 'no');
+    assert.equal(buys.length, 1);
+    assert.equal(sells.length, 1);
+    assert.equal(buys[0]!.limitT, 85);
+    assert.equal(sells[0]!.limitT, 115);
+  });
+
+  it('computes expectedProfit correctly with fractional ticks', () => {
+    const b = book([], [[97, 60]]);
+    const band = { loT: 100, hiT: 105 };
+    const snipes = findSnipes(b, band, 0, 100);
+    // gain = 100 - 97 = 3 ticks; profit = 60 * 3 / 200 = 0.9
+    assert.ok(Math.abs(snipes[0]!.expectedProfit - 0.9) < 1e-9);
   });
 });
