@@ -129,9 +129,9 @@ describe('maxOrderSize, race level cap', () => {
   });
 
   it('short on both legs at the cap: asks 0, bids still allowed', () => {
-    const l: RiskLimits = { maxLegShares: 1000, maxRaceDelta: 600, maxRaceLevel: 300 };
+    const l: RiskLimits = { maxLegShares: 1000, maxRaceDelta: 1000, maxRaceLevel: 300 };
     assert.equal(maxOrderSize('ask', [-300, -300], [0, 0], 0, l), 0);
-    // level room (300 + 300) * 2 = 1200 binds, tighter than leg room 1300
+    // level room (300 + 300) * 2 = 1200 binds, tighter than leg room 1300 and delta room 1000 / 0.5 = 2000
     assert.equal(maxOrderSize('bid', [-300, -300], [0, 0], 0, l), 1200);
     assert.ok(maxOrderSize('bid', [-300, -300], [0, 0], 0, { ...l, maxLegShares: 400 }) > 0);
   });

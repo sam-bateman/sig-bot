@@ -381,6 +381,8 @@ export class Engine {
         continue;
       }
 
+      const level = raceLevel(netYes);
+
       // After an arb the held books still show the liquidity it just took until fresh ones arrive,
       // so the same arb would fire again on stale state.
       const arbReady = (this.arbCooldown.get(race.name) ?? 0) <= Date.now() && !this.needReconcile && !this.frozen;
@@ -390,7 +392,12 @@ export class Engine {
           arb.kind === 'sell-all' ? config.risk.maxLegShares + q - pending.ask[i]! : config.risk.maxLegShares - q - pending.bid[i]!,
         );
         const cost = arb.legs.reduce((a, l) => a + orderCost(l.side === 'bid' ? 'ask' : 'bid', l.priceT, 1), 0);
-        const quantity = Math.floor(Math.min(arb.quantity, ...room, Math.max(0, budget) / cost));
+        // A sell-all shorts every leg by the quantity, so it lowers the level by that much; a buy-all raises it.
+        const levelRoom =
+          arb.kind === 'sell-all'
+            ? config.risk.maxRaceLevel + level - raceLevel(pending.ask)
+            : config.risk.maxRaceLevel - level - raceLevel(pending.bid);
+        const quantity = Math.floor(Math.min(arb.quantity, ...room, levelRoom, Math.max(0, budget) / cost));
         // Each arb costs several writes (cancels plus the multi-leg), so skip dust.
         if (quantity >= config.arb.minShares && quantity * fromTicks(arb.edgeTicks) >= config.arb.minProfit) {
           arbs.push({ race, arb: { ...arb, quantity } });
@@ -406,7 +413,6 @@ export class Engine {
       }
       const fairs = fairValues(touches as Touch[], s.otherMaxTicks);
       const deltas = raceDeltas(netYes);
-      const level = raceLevel(netYes);
 
       race.legs.forEach((leg, i) => {
         const q = quoteLeg(fairs[i]!, touches[i]!, deltas[i]!, s, level);
@@ -415,9 +421,11 @@ export class Engine {
           if (priceT === null) continue;
           if ((this.cooldown.get(`${leg.exchangeId}:${side}`) ?? 0) > Date.now()) continue;
           // A bid buys back a short, an ask sells down a long: those shrink risk and free capital,
-          // so they skip the capital budget and stay allowed while positions are unconfirmed.
+          // so they skip the capital budget and the level cap, and stay allowed while positions are unconfirmed.
+          // The level unwinds separately; a leg's own risk matters more.
           const reduces = side === 'bid' ? netYes[i]! < 0 : netYes[i]! > 0;
-          let size = Math.min(s.quoteSize, maxOrderSize(side, netYes, pending[side], i, config.risk));
+          const limits = reduces ? { ...config.risk, maxRaceLevel: Infinity } : config.risk;
+          let size = Math.min(s.quoteSize, maxOrderSize(side, netYes, pending[side], i, limits));
           if (pending[side][i]! > 0 && size < s.quoteSize) confirmSoon = true;
           if (reduces) size = Math.min(size, Math.abs(netYes[i]!) - pending[side][i]!);
           if (size < 1 || (this.frozen && !reduces)) continue;
