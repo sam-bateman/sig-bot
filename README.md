@@ -50,6 +50,8 @@ All settings are environment variables. Read from `.env` if it exists. Defaults 
 | `SIG_CYCLE_MS` | 5000 | Main loop interval (milliseconds) |
 | `SIG_QUOTE_TTL_SEC` | 60 | Quote expiry (seconds) |
 | `SIG_RECONCILE_MS` | 60000 | Reconciliation interval (milliseconds) |
+| `SIG_REALTIME_JOIN_TIMEOUT_MS` | 60000 | Realtime channel join timeout (milliseconds); joins queue behind each other on a socket |
+| `SIG_REALTIME_CHANNELS_PER_SOCKET` | 8 | Realtime channels per socket; the server handles a socket's joins and heartbeats one at a time |
 | `SIG_MAX_RACES` | 20 | Max races to quote |
 | `SIG_HALF_EDGE_TICKS` | 2 | Half-width of quotes around fair (in ticks; 1 tick = 0.005) |
 | `SIG_QUOTE_SIZE` | 200 | Order size (shares per quote) |
@@ -71,7 +73,7 @@ All settings are environment variables. Read from `.env` if it exists. Defaults 
 
 ## How It Works
 
-**Book updates** come over a Supabase realtime feed. On gaps, the bot fetches the full book via REST. Your own orders are subtracted from the external book before computing fair value, so you don't trade against yourself.
+**Book updates** come over a Supabase realtime feed, with the channels spread over several sockets (`SIG_REALTIME_CHANNELS_PER_SOCKET` each) because the server handles each socket's joins and heartbeats one at a time. On gaps, the bot fetches the full book via REST. Your own orders are subtracted from the external book before computing fair value, so you don't trade against yourself.
 
 **Quoting**: every cycle (default 5s), compute fair values and deltas for each race, check risk limits, and generate quotes. Quotes expire after 60 seconds, so they die if the bot crashes. To re-quote, cancel all orders in a market or tournament-wide (whichever costs fewer API writes) and place new ones. Orders batch up to 25 per write.
 
